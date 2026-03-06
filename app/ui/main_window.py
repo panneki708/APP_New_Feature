@@ -1,0 +1,3998 @@
+import os
+import json
+import time
+import re
+import logging
+import paramiko
+from datetime import datetime
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QLineEdit, QPushButton, QComboBox, QTextEdit,
+    QGroupBox, QTabWidget, QScrollArea, QProgressBar,
+    QTextBrowser, QFrame, QSizePolicy, QMessageBox, QSpacerItem,
+    QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
+    QPlainTextEdit, QInputDialog, QFileDialog,
+    QDialog, QListWidget, QListWidgetItem, QDialogButtonBox
+)
+from PyQt5.QtCore import Qt, pyqtSignal, QObject, QDate, QThread, QTimer
+from PyQt5.QtGui import QFont, QTextCursor, QColor
+from PyQt5.QtWidgets import QDateEdit
+
+from app.core.logger import logger, log_function
+from app.core.excel_logger import ExcelLogger, excel_logger
+from app.ssh.ssh_handler import SSH_setup
+from app.ssh.worker import Worker
+from app.ssh.console_worker import SshConsoleWorker
+from app.ssh.scp_worker import ScpWorker
+from app.dialogs.remote_file_browser import RemoteFileBrowserDialog
+from app.widgets.terminal_widget import TerminalWidget
+
+class TestStationInterface(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.excel_logger = excel_logger
+        self.setWindowTitle("Test Station Interface")
+        self.config = ''
+        self.assembly_suffix = None
+
+        # Set minimum size instead of fixed geometry
+        self.setMinimumSize(1000, 700)
+
+        # Central widget with layout
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QVBoxLayout(self.central_widget)
+        self.main_layout.setContentsMargins(8, 8, 8, 8)
+        self.main_layout.setSpacing(8)
+        self.Zone1_Inner_res = 0
+        self.Zone2_Mid_Inner_res = 0
+        self.Zone3_Mid_Edge_res = 0
+        self.Zone4_Edge_res = 0
+        self.Zone5_Outer_res = 0
+        self.Zone1_Inner_imp = 0
+        self.Zone2_Mid_Inner_imp = 0
+        self.Zone3_Mid_Edge_imp = 0
+        self.Zone4_Edge_imp = 0
+        self.Zone5_Outer_imp = 0
+        #self.config_transfer()
+
+        # Initialize other components
+        self.ssh_handler = SSH_setup()
+        self.console_output = None
+        self.check = False
+        self.handling_flag = 0
+        self.Firmware_check = True
+        self.worker = None
+        self.worker_thread = None
+        self.open_count = 0
+        self.closed_count = 0
+        self.logger = logger.getChild('TestStationInterface')
+        self.check_true = 0
+        self.dimm_timer = QTimer()
+        self.vna_timer = QTimer()
+        self.vna_timer.timeout.connect(self.update_vna_progress)
+        self.dimm_timer.timeout.connect(self.update_dimm_progress)
+        self.dimm_progress_value = 0
+        self.vna_progress_value = 0
+        self.names = ''
+        self.unit_test = 0
+        self.impedance_scan = 0
+        self.self_t = 0
+        self.Res_scan = 0
+        self.bnc_t = 0
+        self.VNA_c = 0
+        self.DIMM_CAL = 0
+        self.interlock_t = 0
+        self.step_no = 0
+        self.resistance_test = 'PASS'
+        self.Impedance_test = 'PASS'
+        self.over_all_result = 'PASS'
+        self.test_result = 'PASS'
+        self.PN = ''
+        self.SN = ''
+        self.init_ui()
+        self.stop_increment = False
+
+    def closeEvent(self, event):
+        self.cleanup_resources()
+        event.accept()
+
+    """      
+    def config_transfer(self):
+        #host = "192.168.1.2"  # Replace with your Pi's IP
+        host = "10.119.28.136"
+        username = "robot"
+        password = "robot"  # Default, change if needed
+
+        # File paths
+        local_file = "C:\\Config\\config.json"  # Windows path
+        remote_file = "/home/robot/Manufacturing_test/aipc_beta/config.json"  # Destination on Pi
+        local_file1 = "C:\\Config\\zone_config.cfg"  # Windows path
+        remote_file1 = "/home/robot/Manufacturing_test/aipc_beta/zone_config.cfg"  # Destination on Pi
+
+        # Initialize SSH client
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(host, username=username, password=password)
+
+        # Transfer file using SFTP
+        sftp = ssh.open_sftp()
+        sftp.put(local_file, remote_file)
+        sftp.put(local_file1, remote_file1)
+        sftp.close()
+        ssh.close()
+    """
+
+    def config_transfer(self, suffix):
+        """
+        Transfer config files to RPI based on assembly part number suffix.
+        suffix: '003' or '004' - determines which config directory to use
+        """
+        # host = "192.168.1.2"  # Replace with your Pi's IP
+        host = "10.119.9.225"
+        username = "robot"
+        password = "robot"  # Default, change if needed
+
+        # Determine config directory based on suffix
+        if suffix is None:
+            config_dir = "C:\\Config"
+        else:
+            config_dir = f"C:\\Config\\{suffix}"
+
+        # File paths
+        local_file = f"{config_dir}\\config.json"  # Windows path
+        remote_file = "/home/robot/Manufacturing_test/aipc_beta/config.json"  # Destination on Pi
+        local_file1 = f"{config_dir}\\zone_config.cfg"  # Windows path
+        remote_file1 = "/home/robot/Manufacturing_test/aipc_beta/zone_config.cfg"  # Destination on Pi
+
+        if not os.path.exists(local_file):
+            error_msg = f"Configuration file not found: {local_file}"
+            self.append_console_message(error_msg + "\n", is_error=True)
+            self.logger.error(error_msg, extra={'func_name': 'config_transfer'})
+            QMessageBox.critical(self, "ERROR : ", error_msg)
+            return False
+
+
+        if not os.path.exists(local_file1):
+            error_msg = f"Zone configuration file not found: {local_file1}"
+            self.append_console_message(error_msg + "\n", is_error=True)
+            self.logger.error(error_msg, extra={'func_name': 'config_transfer'})
+            QMessageBox.critical(self, "ERROR : ", error_msg)
+            return False
+
+
+        # Initialize SSH client
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(host, username=username, password=password)
+
+        # Transfer file using SFTP
+        sftp = ssh.open_sftp()
+        sftp.put(local_file, remote_file)
+        sftp.put(local_file1, remote_file1)
+        sftp.close()
+        ssh.close()
+        return True
+
+    def _extract_assembly_suffix(self, assembly_part_number):
+        """
+        Extract the suffix (003 or 004) from assembly part number.
+        Format: XXX-AXXXXX-003 or XXX-AXXXXX-004
+        Returns: '003', '004', or None if invalid format
+        """
+        parts = assembly_part_number.split('-')
+        if len(parts) == 3:
+            suffix = parts[2]
+            if suffix in ['003', '004', '005']:
+                return suffix
+        return None
+
+    def load_config(self, suffix):
+        try:
+            if suffix is None:
+                raise ValueError("Assembly suffix is not set; cannot determine config path.")
+            with open(rf'C:\Config\{suffix}\config.json') as f:
+                return json.load(f)
+        except Exception as e:
+            # logger.error(f"Error loading config: {str(e)}")
+            self.logger.error(f"Error loading config: {str(e)}", exc_info=True,
+                               extra={'func_name': 'load_config'})
+
+            return {"expected_firmware_version": "0.0.0"}
+
+    def create_otp_file(self, fname: str,
+                        app_pn: str, app_sn: str,
+                        assy_pn: str, assy_sn: str) -> None:
+        """
+        Creates an OTP (One-Time Program) file with board and assembly information.
+
+        Args:
+            fname: File name/path to create
+            app_pn: Application board part number
+            app_sn: Application board serial number
+            assy_pn: Assembly part number
+            assy_sn: Assembly serial number
+
+        Raises:
+            IOError: If file cannot be written
+        """
+        try:
+            header = "# LAM Research App Board and Assy Part and Serial Number"
+            content = [
+                header,
+                f"Board PN: {app_pn}",
+                f"Board SN: {app_sn}",
+                f"Assy PN: {assy_pn}",
+                f"Assy SN: {assy_sn}",
+                ""  # Adds final newline
+            ]
+            self.append_console_message("Write APPOTP FILE")
+            with open(fname, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(content))
+
+        except IOError as e:
+            self.append_console_message("Failed to create OTP file ",is_error= True)
+            raise IOError(f"Failed to create OTP file {fname}") from e
+
+    def start_dimm_progress(self):
+        """Start the 12-second progress timer"""
+        self.dimm_progress_value = 0
+        self.dimm_progress.setValue(0)
+        self.dimm_timer.start(130)  # 120ms interval for 12 seconds (100*120ms=12s)
+
+    def start_vna_progress(self):
+        """Start the 12-second progress timer"""
+        self.vna_progress_value = 0
+        self.vna_progress.setValue(0)
+        self.vna_timer.start(1800)  # 1800ms interval for 180 seconds (100*1800ms=12s)
+
+    def update_dimm_progress(self):
+        """Update progress bar incrementally"""
+        self.dimm_progress_value += 1
+        self.dimm_progress.setValue(self.dimm_progress_value)
+
+        if self.dimm_progress_value >= 100:
+            self.dimm_timer.stop()
+            self.dimm_progress.setValue(100)
+
+    def update_vna_progress(self):
+        """Update progress bar incrementally"""
+        self.vna_progress_value += 1
+        self.vna_progress.setValue(self.vna_progress_value)
+
+        if self.vna_progress_value >= 100:
+            self.vna_timer.stop()
+            self.vna_progress.setValue(100)
+
+    def validate_part_number(self, part_number, part_type):
+        pattern = r"^\d{3}-[A-Z]\d{5}-\d{3}$"
+        if not re.match(pattern, part_number):
+            QMessageBox.critical(
+                self,
+                "Validation Error",
+                f"Invalid {part_type} number format!\n\n"
+                f"Entered: {part_number}\n"
+                "Expected format: XXX-AXXXXX-XXX\n"
+                "(3 digits, hyphen, uppercase letter, 5 digits, hyphen, 3 digits)"
+            )
+            return False
+        return True
+
+    def validate_revision_number(self, serial_number, part_type):
+        pattern = r"^[a-zA-Z]$"
+        if not re.match(pattern, serial_number):
+            QMessageBox.critical(
+                self,
+                "Validation Error",
+                f"Invalid {serial_number} number format!\n\n"
+                f"Entered: {serial_number}\n"
+                "Expected format: [A-Z]or[a-z]\n"
+            )
+            return False
+        return True
+
+    def parse_ssh_output(self, output):
+        results = {
+            'product_id': 'Not found',
+            'esi_revision': 'Not found',
+            'firmware_version': 'Not found',
+            'ethercat_address': 'Not found',
+            'pcb_part_number': 'Not found',
+            'pcb_serial_number': 'Not found',
+            'assembly_part_number': 'Not found',
+            'assembly_serial_number': 'Not found'
+        }
+
+        # Extract standard fields
+        product_code_match = re.search(r'Product Code: ([^\n]+)', output, re.DOTALL)
+        if product_code_match:
+            results['product_id'] = product_code_match.group(1).strip()
+
+        revision_match = re.search(r'Revision: ([^\n]+)', output, re.DOTALL)
+        if revision_match:
+            results['esi_revision'] = revision_match.group(1).strip()
+
+        ECAT_add = re.search(r'ECAT Address: ([^\n]+)', output, re.DOTALL)
+        if ECAT_add:
+            results['ethercat_address'] = ECAT_add.group(1).strip()
+
+        version_match = re.search(r'Software version: ([^\n]+)', output)
+        if version_match:
+            results['firmware_version'] = version_match.group(1).strip()
+
+        # Extract OTP programmed values
+        pcb_pn_match = re.search(r'PCB_Part_Number:([^\s]+)', output)
+        if pcb_pn_match:
+            results['pcb_part_number'] = pcb_pn_match.group(1).strip()
+
+        pcb_sn_match = re.search(r'PCB_Serial_Number:([^\s]+)', output)
+        if pcb_sn_match:
+            results['pcb_serial_number'] = pcb_sn_match.group(1).strip()
+
+        assy_pn_match = re.search(r'Assembly_Part_Number:([^\s]+)', output)
+        if assy_pn_match:
+            results['assembly_part_number'] = assy_pn_match.group(1).strip()
+
+        assy_sn_match = re.search(r'Assembly_Serial_Number:([^\s]+)', output)
+        if assy_sn_match:
+            results['assembly_serial_number'] = assy_sn_match.group(1).strip()
+
+        return results
+
+    def append_console_message(self, message, is_error=False):
+        """Helper method to append colored messages to console"""
+        if hasattr(self, 'console_output') and self.console_output is not None:
+            if is_error:
+                self.console_output.append(f'<span style="color:#f85149; font-weight:bold;">{message}</span>')
+            else:
+                self.console_output.append(f'<span style="color:#3fb950; font-weight:bold;">{message}</span>')
+            # Auto-scroll to bottom
+            self.console_output.verticalScrollBar().setValue(
+                self.console_output.verticalScrollBar().maximum()
+            )
+
+    def handle_ssh_error(self, error_msg):
+        if hasattr(self, 'console_output') and self.console_output is not None:
+            self.append_console_message(f"!!! SSH ERROR !!!\n{error_msg}\n", is_error=True)
+
+        QMessageBox.critical(self, "SSH Error", error_msg)
+
+    def VNA_cal_test(self):
+        try:
+
+            if hasattr(self, 'worker') and self.worker:
+                self.worker.stop()
+
+            self.vna_t = time.time()
+            # Reset UI state
+            self.VNAtest_console.clear()
+            self.VNA_status_label_start.setText("● Running…")
+            self.VNA_status_label_start.setStyleSheet(self._PILL_RUN_SS)
+            self.start_vna_progress()
+            self.VNA_start_button.setEnabled(False)
+
+            self.append_vna_message("\n================== VNA CAL Test Started =======================\n")
+
+            self.worker = Worker(
+                self.ssh_handler,
+                '/home/robot/Manufacturing_test/aipc_beta/vnacalibration.py',
+                f'dimm 50000 70000',
+                350
+            )
+            self.worker.output_ready.connect(self.handle_vna_output)
+            self.worker.finished_signal.connect(self.on_vna_test_finished)
+            self.worker.error_occurred.connect(self.handle_vna_error)
+
+            # Start the thread
+            self.worker.start()
+
+        except Exception as e:
+            self.append_vna_message(f"Failed to start test: {str(e)}", is_error=True)
+            self.cleanup_resources()
+
+    def handle_vna_output(self, line):
+        try:
+            self.append_vna_message(f"{line}\n")
+            if "no ping" in line:
+                self.append_vna_message(f"VNA not connected to the Network", is_error=True)
+                self.worker.stop()
+                self.VNA_start_button.setEnabled(True)
+
+            if "Calibration PASS" in line:
+                self.VNA_status_label_start.setText('● Completed — PASS')
+                self.VNA_status_label_start.setStyleSheet(self._PILL_PASS_SS)
+                self.append_vna_message("\n=== VNA Calibration PASSED ===")
+                self.vna_timer.stop()
+                self.worker.stop()
+                self.VNA_start_button.setEnabled(True)
+                # self.work_timeout = 30
+
+            elif "Calibration FAIL" in line :
+                self.VNA_status_label_start.setText('● Completed — FAIL')
+                self.VNA_status_label_start.setStyleSheet(self._PILL_FAIL_SS)
+                self.append_vna_message("\n!!! VNA Calibration FAILED !!!", is_error=True)
+
+                self.vna_timer.stop()
+                self.worker.stop()
+                self.VNA_start_button.setEnabled(True)
+                # self.work_timeout = 30
+            elif "ERROR: Connect ECal module" in line :
+                self.VNA_status_label_start.setText('● Completed — FAIL')
+                self.VNA_status_label_start.setStyleSheet(self._PILL_FAIL_SS)
+                self.append_vna_message("\n!!! VNA Calibration FAILED : Please connect Ecal Module... !!!", is_error=True)
+                self.vna_timer.stop()
+                self.worker.stop()
+                self.VNA_start_button.setEnabled(True)
+
+        except Exception as e:
+            # self.work_timeout = 30
+            self.append_vna_message(f"Error processing output: {str(e)}", is_error=True)
+            self.VNA_start_button.setEnabled(True)
+
+    def on_vna_test_finished(self):
+        self.vna_timer.stop()
+        self.VNA_start_button.setEnabled(True)
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.stop()
+
+        # If test didn't explicitly pass or fail, mark it as incomplete
+        if "Passed" not in self.VNA_status_label_start.text() and "Failed" not in self.VNA_status_label_start.text():
+            self.VNA_status_label_start.setText('● Incomplete')
+            self.VNA_status_label_start.setStyleSheet(self._PILL_GRAY_SS)
+            self.append_vna_message("\n!!! Test did not complete properly !!!", is_error=True)
+        # self.work_timeout = 30
+
+    def handle_vna_error(self, error_msg):
+        self.vna_timer.stop()
+        # self.work_timeout = 30
+        self.cleanup_resources()
+        self.append_vna_message(f"\n!!!  ERROR: {error_msg} !!!", is_error=True)
+        self.VNA_start_button.setEnabled(True)
+
+    def program_otp(self):
+        if hasattr(self, 'console_output') and self.console_output is not None:
+            self.console_output.clear()
+        pcb_part_number = self.pcb_pn_input.text().strip()
+        assembly_part_number = self.assembly_pn_input.text().strip()
+        assembly_ser = self.assembly_sn_input.text().strip()
+        assembly_rev = self.assembly_rev_input.text().strip()
+        PCB_rev = self.pcb_rev_input.text().strip()
+        PCB_ser = self.pcb_sn_input.text().strip()
+        if len(pcb_part_number) == 0:
+            self.append_console_message(f"ERROR: PCB part number not Entered\n", is_error=True)
+            QMessageBox.critical(self, "Error", f"PCB part number not Entered")
+            self.logger.error(f"PCB part number not Entered",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+        if len(PCB_rev) == 0:
+            self.append_console_message(f"ERROR: PCB Revision not Entered\n", is_error=True)
+            QMessageBox.critical(self, "Error", f"PCB Revision not Entered")
+            self.logger.error(f"PCB Revision not Entered",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+        if len(assembly_ser) == 0:
+            self.append_console_message(f"ERROR: Assembly Serial number not Entered\n", is_error=True)
+            QMessageBox.critical(self, "Error", f"Assembly Serial number not Entered")
+            # logger.error("Assembly Serial number not Entered")
+            self.logger.error(f"Assembly Serial number not Entered",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+        if len(assembly_rev) == 0:
+            self.append_console_message(f"ERROR: Assembly Revision not Entered\n", is_error=True)
+            QMessageBox.critical(self, "Error", f"Assembly Revision not Entered")
+            # logger.error("Assembly Revision not Entered")
+            self.logger.error(f"Assembly Revision not Entered",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+
+        if len(PCB_ser) == 0:
+            self.append_console_message(f"ERROR: PCB Serial not Entered\n", is_error=True)
+            QMessageBox.critical(self, "Error", f"PCB Serial not Entered")
+            self.logger.error(f"PCB Serial not Entered",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+
+        if len(assembly_part_number) == 0:
+            self.append_console_message(f"ERROR :Assembly part number  not Entered \n", is_error=True)
+            QMessageBox.critical(self, "Error", f"Assembly part number  not Entered")
+            self.logger.error(f"Assembly part number  not Entered",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+
+        if not pcb_part_number or not self.validate_part_number(pcb_part_number, "PCB"):
+            self.append_console_message(f"ERROR: Invalid PCB Part Number: {pcb_part_number}\n", is_error=True)
+            self.logger.error(f"ERROR: Invalid PCB Part Number: {pcb_part_number}",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+
+        if not PCB_rev or not self.validate_revision_number(PCB_rev, "PCB"):
+            self.append_console_message(f"ERROR: Invalid PCB Revision Number: {PCB_rev}\n", is_error=True)
+            self.logger.error(f"ERROR: Invalid PCB Revision : {PCB_rev}",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+
+        if not assembly_part_number or not self.validate_part_number(assembly_part_number, "Assembly"):
+            self.append_console_message(f"ERROR: Invalid Assembly Part Number: {assembly_part_number}\n",
+                                        is_error=True)
+            self.logger.error(f"ERROR: Invalid Assembly Part Number: {assembly_part_number}",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+
+        if not assembly_rev or not self.validate_revision_number(assembly_rev, "Assembly"):
+            self.append_console_message(f"ERROR: Invalid Assembly Revision Number: {assembly_rev}\n", is_error=True)
+            self.logger.error(f"ERROR: Invalid Assembly Revision : {assembly_rev}",
+                              extra={'func_name': 'auto_load_connect'})
+            return
+
+        #self.append_console_message("Part numbers validated successfully. Connecting...\n\n")
+        QApplication.processEvents()  # Update UI
+
+
+        self.create_otp_file("C:\\tmp\\APPOTP", pcb_part_number, PCB_ser, assembly_part_number,assembly_ser)
+        self.file_transer("C:\\tmp\\APPOTP","/home/robot/Manufacturing_test/aipc_beta/APPOTP")
+        time.sleep(1)
+        success, message = self.ssh_handler.Connect_RPI()
+        if not success:
+            self.handle_ssh_error(f"Connection failed: {message}")
+            return
+
+        self.execute_command("programotp", self.handle_otp_test_output, 0)
+
+    def handle_otp_test_output(self,stdout, stderr):
+        test_passed = "UPDATE_PASS" in stdout
+        test_details = stdout.strip()
+
+        if "Error in slave initialization" in test_details:
+            QMessageBox.critical(
+                self,
+                "Critical Error",
+                "Slave initialization failed! Please check the EtherCAT connection and restart the test."
+            )
+            self.test_status_label_start.setText("Failed")
+
+        if test_passed:
+            self.append_console_message("OTP Update PASS")
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Information)
+            msg.setText(f"Insert the SD card and update the Firmware")
+            msg.setWindowTitle("Firmware Update")
+            msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            retval = msg.exec_()
+
+        else:
+            self.append_console_message("OTP Update FAIL", is_error=True)
+
+
+
+    def auto_load_connect(self):
+        self.test_result = "PASS"
+        if hasattr(self, 'console_output') and self.console_output is not None:
+            self.console_output.clear()
+
+        try:
+            # self.config = self.load_config()
+            
+            if self.unit_test >= 1:
+                excel_logger.reset_sheet("Unit Setup")
+            self.unit_test += 1
+            # Validate PCB Part Number
+            # logger.info("Unit SETUP Test")
+            self.auto_load_btn.setEnabled(False)
+            self.append_console_message("==========TEST Started=============\n")
+            Fixture = self.Fixture.text().strip()
+            Testing_name = self.Test_name.text().strip()
+            Ecal = self.Ecal_SN.text().strip()
+            VNA = self.VNA_SN.text().strip()
+            Vendor_name = self.Vendor_name.text().strip()
+            pcb_part_number = self.pcb_pn_input.text().strip()
+            assembly_part_number = self.assembly_pn_input.text().strip()
+            assembly_ser = self.assembly_sn_input.text().strip()
+            assembly_rev = self.assembly_rev_input.text().strip()
+            PCB_rev = self.pcb_rev_input.text().strip()
+            PCB_ser = self.pcb_sn_input.text().strip()
+            self.test_result = 'PASS'
+            self.PN = assembly_part_number
+            self.SN = assembly_ser
+
+            self.append_console_message("1. Validate Entry check\n")
+
+            if len(pcb_part_number) == 0:
+                self.append_console_message(f"ERROR: PCB part number not Entered\n", is_error=True)
+                QMessageBox.critical(self, "Error", f"PCB part number not Entered")
+                self.logger.error(f"PCB part number not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+            if len(PCB_rev) == 0:
+                self.append_console_message(f"ERROR: PCB Revision not Entered\n", is_error=True)
+                QMessageBox.critical(self, "Error", f"PCB Revision not Entered")
+                self.logger.error(f"PCB Revision not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+            if len(assembly_ser) == 0:
+                self.append_console_message(f"ERROR: Assembly Serial number not Entered\n", is_error=True)
+                QMessageBox.critical(self, "Error", f"Assembly Serial number not Entered")
+                # logger.error("Assembly Serial number not Entered")
+                self.logger.error(f"Assembly Serial number not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+            if len(assembly_rev) == 0:
+                self.append_console_message(f"ERROR: Assembly Revision not Entered\n", is_error=True)
+                QMessageBox.critical(self, "Error", f"Assembly Revision not Entered")
+                # logger.error("Assembly Revision not Entered")
+                self.logger.error(f"Assembly Revision not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if len(PCB_ser) == 0:
+                self.append_console_message(f"ERROR: PCB Serial not Entered\n", is_error=True)
+                QMessageBox.critical(self, "Error", f"PCB Serial not Entered")
+                self.logger.error(f"PCB Serial not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if len(assembly_part_number) == 0:
+                self.append_console_message(f"ERROR :Assembly part number  not Entered \n", is_error=True)
+                QMessageBox.critical(self, "Error", f"Assembly part number  not Entered")
+                self.logger.error(f"Assembly part number  not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if len(Vendor_name) == 0:
+                self.append_console_message(f"ERROR :Vendor Name not Entered \n", is_error=True)
+                QMessageBox.critical(self, "Error", f"Vendor Name not Entered")
+                self.logger.error(f"Vendor Name  not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if len(Fixture) == 0:
+                self.append_console_message(f"ERROR :Fixture Number not Entered \n", is_error=True)
+                QMessageBox.critical(self, "Error", f"Fixture Number not Entered")
+                self.logger.error(f"Fixture Number not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if len(Testing_name) == 0:
+                self.append_console_message(f"ERROR: Test Name not Entered\n", is_error=True)
+                QMessageBox.critical(self, "Error", f"Test Operator Name not Entered")
+                self.logger.error(f"Test Operator Name not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+            if len(Ecal) == 0:
+                self.append_console_message(f"ERROR : ECAL SN not Entered \n", is_error=True)
+                QMessageBox.critical(self, "Error", f"ECAL SN not Entered")
+                self.logger.error(f"ECAL SN not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+            if len(VNA) == 0:
+                self.append_console_message(f"ERROR: VNA SN not Entered\n", is_error=True)
+                QMessageBox.critical(self, "Error", f"VNA SN not Entered")
+                self.logger.error(f"VNA SN not Entered",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if not pcb_part_number or not self.validate_part_number(pcb_part_number, "PCB"):
+                self.append_console_message(f"ERROR: Invalid PCB Part Number: {pcb_part_number}\n", is_error=True)
+                self.logger.error(f"ERROR: Invalid PCB Part Number: {pcb_part_number}",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if not PCB_rev or not self.validate_revision_number(PCB_rev, "PCB"):
+                self.append_console_message(f"ERROR: Invalid PCB Revision Number: {PCB_rev}\n", is_error=True)
+                self.logger.error(f"ERROR: Invalid PCB Revision : {PCB_rev}",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if not assembly_part_number or not self.validate_part_number(assembly_part_number, "Assembly"):
+                self.append_console_message(f"ERROR: Invalid Assembly Part Number: {assembly_part_number}\n",
+                                            is_error=True)
+                self.logger.error(f"ERROR: Invalid Assembly Part Number: {assembly_part_number}",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+            if not assembly_rev or not self.validate_revision_number(assembly_rev, "Assembly"):
+                self.append_console_message(f"ERROR: Invalid Assembly Revision Number: {assembly_rev}\n", is_error=True)
+                self.logger.error(f"ERROR: Invalid Assembly Revision : {assembly_rev}",
+                                  extra={'func_name': 'auto_load_connect'})
+                return
+
+
+
+            self.append_console_message("Part numbers validated successfully. Connecting...\n\n")
+            QApplication.processEvents()  # Update UI
+
+            assembly_suffix = self._extract_assembly_suffix(assembly_part_number)
+            self.assembly_suffix = assembly_suffix
+            if assembly_suffix:
+                self.append_console_message(f"Using configuration for assembly suffix: {assembly_suffix}\n")
+                if self.config_transfer(assembly_suffix) == False:
+                    return
+                self.config = self.load_config(assembly_suffix)
+                
+
+                
+
+            else:
+                self.append_console_message(
+                    f"WARNING: Assembly part number suffix not recognized.Please check the part no and  update the config file\n", is_error=True)
+                return
+                #self.config_transfer()  # Use default config
+
+
+            # Connect to SSH
+            success, message = self.ssh_handler.Connect_RPI()
+            if not success:
+                self.handle_ssh_error(f"Connection failed: {message}")
+                return
+
+            # Execute commands sequentially
+            commands = [
+                ("soemcompile", self.handle_soemcompile_output),
+                ("firmwarecheck", self.handle_firmare_check_output),
+                ("otpcheck", self.handle_otpcheck_output),
+                ("slaveinfo", self.handle_slaveinfo_output)
+            ]
+            val = 2
+            for cmd, handler in commands:
+                if not self.execute_command(cmd, handler, val):
+                    if cmd != 'firmwarecheck':
+                        break  # Stop if any command fails
+                    if self.Firmware_check == False:
+                        break
+
+                val = val + 1
+            self.append_console_message(
+                "======================== Unit Setup completed====================================\n")
+            # Log metadata along with test data
+            self.excel_logger.log_summary(
+                metadata={
+                    'eid': f'{self.assembly_pn_input.text().strip()}_{self.assembly_rev_input.text().strip()}_{self.assembly_sn_input.text().strip()[-3:]}',
+                    'serial_number': self.assembly_sn_input.text().strip(),
+                    'model_number': 'AIPC I-BOX',
+                    'version': 'V1.0',
+                    'tester_name': self.Test_name.text().strip(),
+                    'comment': 'Control Limit',
+                    'start_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'end_time': '',  # Will be filled when test completes
+                    'overall_result': '',  # Will be updated to PASS/FAIL
+                    'test_fixture_sn': self.Fixture.text().strip(),
+                    'vna_sn': self.VNA_SN.text().strip(),
+                    'ecal_sn':self.Ecal_SN.text().strip()
+                }
+            )
+
+            unit_data = {
+                'Vendor_name': self.Vendor_name.text().strip(),
+                'Fixture_number': self.Fixture.text().strip(),
+                'test_operator_name': self.Test_name.text().strip(),
+                'test_date': self.Test_Date.date().toString("yyyy-MM-dd"),
+                'vna_calibration_date': self.VNA_calibration.date().toString("yyyy-MM-dd"),
+                'vna_sn': self.VNA_SN.text().strip(),
+                'ecal_sn': self.Ecal_SN.text().strip(),
+                'pcb_part_number': self.pcb_pn_input.text().strip(),
+                'pcb_revision': self.pcb_rev_input.text().strip(),
+                'pcb_serial_number': self.pcb_sn_input.text().strip(),
+                'assembly_part_number': self.assembly_pn_input.text().strip(),
+                'assembly_revision': self.assembly_rev_input.text().strip(),
+                'assembly_serial_number': self.assembly_sn_input.text().strip(),
+                'product_id': self.product_id.text().strip(),
+                'esi_revision': self.esi_revision.text().strip(),
+                'configuration_id': self.configuration_id.text().strip(),
+                'ethercat_address': self.ethercat_address.text().strip(),
+                'firmware_version': self.firmware_version.text().strip()
+            }
+            self.excel_logger.log_unit_setup(unit_data)
+            self.excel_logger.update_overall_result(self.test_result, PN=self.PN, SN=self.SN)
+
+        except Exception as e:
+            # self.logger.error(f"Error in auto_load_connect: {str(e)}",exc_info=True,extra={'func_name': 'auto_load_connect'} )
+            self.auto_load_btn.setEnabled(True)
+            QMessageBox.critical(self, "Error", f"Auto load failed: {str(e)}")
+        finally:
+            self.auto_load_btn.setEnabled(True)
+            self.ssh_handler.SSH_disconnect()
+
+    def dimm_cal_test(self):
+        try:
+
+            if hasattr(self, 'worker') and self.worker:
+                self.worker.stop()
+
+            # Reset UI state
+            self.dimmtest_console.clear()
+            self.DIMM_status_label_start.setText('● Running…')
+            self.DIMM_status_label_start.setStyleSheet(self._PILL_RUN_SS)
+            self.start_dimm_progress()
+            self.dimm_start_button.setEnabled(False)
+
+            self.append_dimm_message("\n================== Dimm Test Started =======================\n")
+
+            self.worker = Worker(
+                self.ssh_handler,
+                '/home/robot/Manufacturing_test/aipc_beta/dimmcalibration.py',
+                'dimm'
+            )
+            self.worker.output_ready.connect(self.handle_dimm_output)
+            self.worker.finished_signal.connect(self.on_dimm_test_finished)
+            self.worker.error_occurred.connect(self.handle_dimm_error)
+
+            # Start the thread
+            self.worker.start()
+
+        except Exception as e:
+            self.append_dimm_message(f"Failed to start test: {str(e)}", is_error=True)
+            self.cleanup_resources()
+
+    def handle_dimm_output(self, line):
+        try:
+            if "no ping" in line:
+                self._log_Impedance_message(f"DIMM not connected to the Network", is_error=True)
+                self.dimm_timer.stop()
+                self.worker.stop()
+                self.dimm_start_button.setEnabled(True)
+            if "Calibration Pass" in line:
+                self.DIMM_status_label_start.setText('● Completed — PASS')
+                self.DIMM_status_label_start.setStyleSheet(self._PILL_PASS_SS)
+                self.append_dimm_message("\n=== DIMM Calibration PASSED ===")
+
+                # Log to Excel
+                """ 
+                unit_identifier = f"{self.assembly_pn_input.text().strip()} ({self.assembly_sn_input.text().strip()})"
+                self.excel_logger.log_self_test(
+                    unit_identifier=unit_identifier,
+                    test_passed=True,
+                    test_details="DIMM Calibration",
+                    notes=line
+                )"""
+                self.dimm_timer.stop()
+                self.worker.stop()
+                self.dimm_start_button.setEnabled(True)
+
+            elif "Calibration Fail" in line:
+                self.DIMM_status_label_start.setText('● Completed — FAIL')
+                self.DIMM_status_label_start.setStyleSheet(self._PILL_FAIL_SS)
+                self.append_dimm_message("\n!!! DIMM Calibration FAILED !!!", is_error=True)
+
+                # Log to Excel
+                """
+                unit_identifier = f"{self.assembly_pn_input.text().strip()} ({self.assembly_sn_input.text().strip()})"
+                self.excel_logger.log_self_test(
+                    unit_identifier=unit_identifier,
+                    test_passed=False,
+                    test_details="DIMM Calibration",
+                    notes=line
+                )"""
+                self.dimm_timer.stop()
+                self.worker.stop()
+                self.dimm_start_button.setEnabled(True)
+
+
+        except Exception as e:
+            self.append_dimm_message(f"Error processing output: {str(e)}", is_error=True)
+            self.dimm_start_button.setEnabled(True)
+
+
+    def on_dimm_test_finished(self):
+        self.dimm_timer.stop()
+        self.dimm_start_button.setEnabled(True)
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.stop()
+
+        # If test didn't explicitly pass or fail, mark it as incomplete
+        if "Passed" not in self.DIMM_status_label_start.text() and "Failed" not in self.DIMM_status_label_start.text():
+            self.DIMM_status_label_start.setText('● Incomplete')
+            self.DIMM_status_label_start.setStyleSheet(self._PILL_GRAY_SS)
+            self.append_dimm_message("\n!!! Test did not complete properly !!!", is_error=True)
+
+
+    def handle_dimm_error(self, error_msg):
+        self.dimm_timer.stop()
+        self.cleanup_resources()
+        self.append_dimm_message(f"\n!!! ERROR: {error_msg} !!!", is_error=True)
+        self.DIMM_status_label_start.setText('● Error')
+        self.DIMM_status_label_start.setStyleSheet(self._PILL_FAIL_SS)
+        self.dimm_start_button.setEnabled(True)
+
+        # Log to Excel
+        unit_identifier = f"{self.assembly_pn_input.text().strip()} ({self.assembly_sn_input.text().strip()})"
+        self.excel_logger.log_self_test(
+            unit_identifier=unit_identifier,
+            test_passed=False,
+            test_details="DIMM Calibration Error",
+            notes=error_msg
+        )
+
+
+    def append_dimm_message(self, message, is_error=False):
+        """Helper method to append colored messages to DIMM console"""
+        if hasattr(self, 'dimmtest_console') and self.dimmtest_console is not None:
+            if is_error:
+                self.dimmtest_console.append(f'<span style="color:#f85149; font-weight:bold;">{message}</span>')
+            else:
+                self.dimmtest_console.append(f'<span style="color:#3fb950; font-weight:bold;">{message}</span>')
+
+            # Auto-scroll to bottom
+            self.dimmtest_console.verticalScrollBar().setValue(
+                self.dimmtest_console.verticalScrollBar().maximum()
+            )
+
+    def append_vna_message(self, message, is_error=False):
+        """Helper method to append colored messages to DIMM console"""
+        if hasattr(self, 'VNAtest_console') and self.VNAtest_console is not None:
+            if is_error:
+                self.VNAtest_console.append(f'<span style="color:#f85149; font-weight:bold;">{message}</span>')
+            else:
+                self.VNAtest_console.append(f'<span style="color:#3fb950; font-weight:bold;">{message}</span>')
+
+            # Auto-scroll to bottom
+            self.VNAtest_console.verticalScrollBar().setValue(
+                self.VNAtest_console.verticalScrollBar().maximum()
+            )
+
+    def append_BNC_message(self, message, is_error=False):
+        """Append a colour-coded HTML message to the BNC test console.
+
+        Args:
+            message (str): The text to display.
+            is_error (bool): When True the text is rendered in red; otherwise green.
+        """
+        if hasattr(self, 'BNCtest_console') and self.BNCtest_console is not None:
+            # Vibrant colours chosen for the dark terminal background
+            colour = "#f85149" if is_error else "#3fb950"
+            self.BNCtest_console.append(
+                f'<span style="color:{colour}; font-weight:bold;">{message}</span>'
+            )
+            # Auto-scroll to the latest output
+            self.BNCtest_console.verticalScrollBar().setValue(
+                self.BNCtest_console.verticalScrollBar().maximum()
+            )
+
+    def BNC_test(self):
+        """Start the BNC Port Verification test sequence.
+
+        Resets state from any previous run, clears the console, and presents
+        the first zone-connection prompt (Zone 2) to the operator.
+        """
+        try:
+            if self.bnc_t >= 1:
+                self.excel_logger.reset_sheet("BNC Port Verification")
+            self.bnc_t += 1
+            self.over_all_result = 'PASS'
+
+            # Stop any previously running worker
+            if hasattr(self, 'worker') and self.worker:
+                self.worker.stop()
+
+            # Reset zone indicator labels to "pending" state
+            if hasattr(self, 'BNC_zone_labels'):
+                for znum, lbl in self.BNC_zone_labels.items():
+                    subtitle = self._BNC_ZONE_SUBTITLES.get(znum, "")
+                    lbl.setText(f"⏳  Zone {znum}\n{subtitle}")
+                    lbl.setStyleSheet("""
+                        QLabel {
+                            background-color: #fff3cd;
+                            color: #856404;
+                            border: 2px solid #ffc107;
+                            border-radius: 6px;
+                            font-size: 9pt;
+                            font-weight: bold;
+                            padding: 4px 6px;
+                        }
+                    """)
+
+            # Reset progress bar
+            if hasattr(self, 'bnc_progress_bar'):
+                self.bnc_progress_bar.setValue(0)
+
+            # Reset UI to "running" state
+            self.BNCtest_console.clear()
+            self.BNC_status_label_start.setText("● Running…")
+            self.BNC_status_label_start.setStyleSheet("""
+                QLabel {
+                    background-color: #fd7e14;
+                    color: white;
+                    padding: 6px 14px;
+                    border-radius: 14px;
+                    font-weight: bold;
+                    font-size: 10pt;
+                }
+            """)
+            self.BNC_start_button.setEnabled(False)
+
+            self.append_BNC_message(
+                "\n================== BNC Test Started =======================\n"
+            )
+
+            # Kick off with the first zone prompt
+            self.show_zone_prompt(2)
+
+        except Exception as e:
+            self.append_BNC_message(f"Failed to start test: {str(e)}", is_error=True)
+            self.cleanup_resources()
+
+    def show_zone_prompt(self, zone_number):
+        """Prompt the operator to connect a zone, then launch the remote test worker.
+
+        Args:
+            zone_number (int): The zone number to display in the prompt dialog.
+        """
+        msg = QMessageBox()
+        msg.setIcon(QMessageBox.Information)
+        msg.setText(f"Please connect Zone {zone_number} and click OK to continue")
+        msg.setWindowTitle("Zone Connection")
+        msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+        command = f'{zone_number} dimm'
+
+        retval = msg.exec_()
+
+        if retval == QMessageBox.Ok:
+            self.start_time1 = time.time()
+            self.append_BNC_message(f"\nTesting Zone {zone_number}...\n")
+
+            # Start a new worker for the remote BNC test script
+            self.worker = Worker(
+                self.ssh_handler,
+                '/home/robot/Manufacturing_test/aipc_beta/BNC.py',
+                command
+            )
+            self.worker.output_ready.connect(self.handle_BNC_output)
+            self.worker.error_occurred.connect(self.handle_BNC_error)
+            self.worker.start()
+        else:
+            self.append_BNC_message("Test cancelled by user", is_error=True)
+            self.BNC_start_button.setEnabled(True)
+            self.BNC_status_label_start.setText("● Cancelled")
+            self.BNC_status_label_start.setStyleSheet("""
+                QLabel {
+                    background-color: #dc3545;
+                    color: white;
+                    padding: 6px 14px;
+                    border-radius: 14px;
+                    font-weight: bold;
+                    font-size: 10pt;
+                }
+            """)
+
+    # ------------------------------------------------------------------ #
+    # BNC zone result helpers                                              #
+    # ------------------------------------------------------------------ #
+
+    # Maps the zone number to its human-readable subtitle used in the UI pill
+    _BNC_ZONE_SUBTITLES = {
+        2: "Mid-Inner",
+        3: "Mid-Edge",
+        4: "Edge",
+        5: "Outer",
+    }
+
+    def _update_bnc_zone_label(self, zone_num, passed):
+        """Update the visual indicator for a completed BNC zone.
+
+        Args:
+            zone_num (int): Zone number (2–5).
+            passed (bool): Whether the zone measurement passed.
+        """
+        if not hasattr(self, 'BNC_zone_labels'):
+            return
+        lbl = self.BNC_zone_labels.get(zone_num)
+        if lbl is None:
+            return
+        subtitle = self._BNC_ZONE_SUBTITLES.get(zone_num, "")
+        if passed:
+            icon = "✅"
+            style = """
+                QLabel {
+                    background-color: #d4edda;
+                    color: #155724;
+                    border: 2px solid #28a745;
+                    border-radius: 6px;
+                    font-size: 9pt;
+                    font-weight: bold;
+                    padding: 4px 6px;
+                }
+            """
+        else:
+            icon = "❌"
+            style = """
+                QLabel {
+                    background-color: #f8d7da;
+                    color: #721c24;
+                    border: 2px solid #dc3545;
+                    border-radius: 6px;
+                    font-size: 9pt;
+                    font-weight: bold;
+                    padding: 4px 6px;
+                }
+            """
+        lbl.setText(f"{icon}  Zone {zone_num}\n{subtitle}")
+        lbl.setStyleSheet(style)
+
+        # Advance the progress bar
+        if hasattr(self, 'bnc_progress_bar'):
+            current = self.bnc_progress_bar.value()
+            self.bnc_progress_bar.setValue(current + 1)
+
+    def _handle_bnc_zone_result(self, zone_label, testpoint_label, line, next_zone_number=None):
+        """Parse a CSV result line for a BNC zone and log the outcome.
+
+        Expected line format: ``<zone_name>,<value_dB>,<PASS|FAIL>``
+
+        After logging, the worker for the current zone is stopped.  If
+        *next_zone_number* is given the operator is prompted to connect that
+        zone; otherwise the full test sequence is marked as complete.
+
+        Args:
+            zone_label (str): Zone identifier expected in the output line
+                (e.g. ``"Zone2-Mid_Inner"``).
+            testpoint_label (str): Short label used in the summary log
+                (e.g. ``"Zone2"``).
+            line (str): Raw output line received from the remote script.
+            next_zone_number (int or None): Zone number to prompt next, or
+                ``None`` when this is the final zone.
+        """
+        parts = line.split(",")
+        if len(parts) < 3:
+            self.append_BNC_message(
+                f"Invalid data format for {zone_label}: {line}", is_error=True
+            )
+            return
+
+        test_name = parts[0]
+        value = parts[1]
+        passed = parts[2].strip().upper() == "PASS"
+
+        # Extract zone number from testpoint_label (e.g. "Zone2" → 2)
+        try:
+            zone_num = int(testpoint_label.replace("Zone", ""))
+        except ValueError:
+            zone_num = None
+
+        if passed:
+            self.append_BNC_message(f"\nBNC Test {zone_label} PASS\n")
+        else:
+            self.append_BNC_message(f"\nBNC Test {zone_label} FAIL\n", is_error=True)
+            self.over_all_result = 'FAIL'
+
+        # Update the visual zone indicator
+        if zone_num is not None:
+            self._update_bnc_zone_label(zone_num, passed)
+
+        self.excel_logger.log_BNC_measurement(
+            test_zone=test_name,
+            test_details=value,
+            test_passed=passed,
+        )
+
+        self.step_no += 1
+        self.excel_logger.log_summary(
+            step_data={
+                'step': str(self.step_no),
+                'unit': 'dB',
+                'low_limit': '-1',
+                'measure': value,
+                'high_limit': '0',
+                'teststep': 'Verify BNC port',
+                'testpoints': testpoint_label,
+                'status': "PASS" if passed else "FAIL",
+            }
+        )
+
+        self.worker.stop()
+
+        if next_zone_number is not None:
+            # Advance to the next zone
+            self.show_zone_prompt(next_zone_number)
+        else:
+            # All zones complete – finalise the test run
+            self.excel_logger.log_summary(
+                metadata={
+                    'end_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    'overall_result': self.over_all_result,
+                }
+            )
+            self.excel_logger.update_overall_result(self.over_all_result)
+            self.append_BNC_message("\nBNC Test completed successfully\n")
+
+            # Update status pill to Completed / Failed depending on overall
+            if self.over_all_result == 'PASS':
+                status_text = "● Completed — PASS"
+                status_style = """
+                    QLabel {
+                        background-color: #28a745;
+                        color: white;
+                        padding: 6px 14px;
+                        border-radius: 14px;
+                        font-weight: bold;
+                        font-size: 10pt;
+                    }
+                """
+            else:
+                status_text = "● Completed — FAIL"
+                status_style = """
+                    QLabel {
+                        background-color: #dc3545;
+                        color: white;
+                        padding: 6px 14px;
+                        border-radius: 14px;
+                        font-weight: bold;
+                        font-size: 10pt;
+                    }
+                """
+            self.BNC_status_label_start.setText(status_text)
+            self.BNC_status_label_start.setStyleSheet(status_style)
+            self.BNC_start_button.setEnabled(True)
+
+    def handle_BNC_output(self, line):
+        """Handle a single line of output from the remote BNC test script.
+
+        Infrastructure errors (EtherCAT slave init failure, PyVISA errors) are
+        shown as blocking modal dialogs and abort the worker immediately.
+
+        Recognised zone-result lines are dispatched to
+        :meth:`_handle_bnc_zone_result`, which parses the CSV payload, logs
+        the result, and advances to the next zone prompt.
+
+        A 90-second watchdog is also checked on every line; if no useful data
+        has arrived within that window the worker is stopped with a warning.
+
+        Args:
+            line (str): A single line of text received from the remote process.
+        """
+        # --- Infrastructure error checks ------------------------------------
+        if "Error in slave initialization" in line:
+            QMessageBox.critical(
+                self,
+                "Critical Error",
+                "Slave initialization failed!\n"
+                "Please check the EtherCAT connection and restart the test.",
+            )
+            self.worker.stop()
+            return
+
+        if "pyvisa.errors" in line:
+            QMessageBox.critical(
+                self,
+                "PyVISA Error",
+                f"A PyVISA error occurred:\n{line.strip()}",
+            )
+            self.worker.stop()
+            return
+
+        # --- Zone result dispatch -------------------------------------------
+        if "Zone2-Mid_Inner" in line:
+            self._handle_bnc_zone_result("Zone2-Mid_Inner", "Zone2", line, next_zone_number=3)
+
+        elif "Zone3-Mid_Edge" in line:
+            self._handle_bnc_zone_result("Zone3-Mid_Edge", "Zone3", line, next_zone_number=4)
+
+        elif "Zone4-Edge" in line:
+            self._handle_bnc_zone_result("Zone4-Edge", "Zone4", line, next_zone_number=5)
+
+        elif "Zone5-Outer" in line:
+            self._handle_bnc_zone_result("Zone5-Outer", "Zone5", line, next_zone_number=None)
+
+        # --- Watchdog: abort if no data received within 90 seconds ----------
+        if time.time() - self.start_time1 > 90:
+            self.append_BNC_message(
+                "=== No data from Raspberry Pi for more than 90 s. "
+                "Please check the Raspberry Pi. ===",
+                is_error=True,
+            )
+            self.worker.stop()
+
+    def handle_BNC_error(self, error_msg):
+        """Handle an error signal emitted by the BNC test worker.
+
+        Displays the error in the console, re-enables the Start button, and
+        cleans up any active resources.
+
+        Args:
+            error_msg (str): The error message reported by the worker.
+        """
+        self.append_BNC_message(f"ERROR: {error_msg}", is_error=True)
+        self.BNC_start_button.setEnabled(True)
+        self.cleanup_resources()
+        self.BNC_status_label_start.setText("● Failed")
+        self.BNC_status_label_start.setStyleSheet("""
+            QLabel {
+                background-color: #dc3545;
+                color: white;
+                padding: 6px 14px;
+                border-radius: 14px;
+                font-weight: bold;
+                font-size: 10pt;
+            }
+        """)
+
+
+    @log_function
+    def execute_command(self, command, output_handler, val):
+        """Execute a single command and handle its output"""
+
+        if command != "selftest":
+            self.append_console_message(f"\n{str(val)}. {command}\n")
+        QApplication.processEvents()  # Update UI
+        self.logger.info(f"Executing command: {command}",
+                         extra={'func_name': command})
+        try:
+            stdout, stderr = self.ssh_handler.SSH_com(command)
+            self.logger.info(f"Command output received",
+                             extra={'func_name': command})
+
+            if stdout:
+                self.logger.debug(f"stdout:\n{stdout}",
+                                  extra={'func_name': command})
+            if stderr:
+                self.logger.error(f"stderr:\n{stderr}",
+                                  extra={'func_name': command})
+            # Process the output
+            if stderr and command != 'soemcompile':
+                self.append_console_message(f"!!! ERROR !!!\n{stderr}\n", is_error=True)
+
+            return output_handler(stdout, stderr)
+
+        except Exception as e:
+            self.logger.error(f"Command failed: {str(e)}",
+                              exc_info=True,
+                              extra={'func_name': command})
+            self.handle_ssh_error(f"Command '{command}' failed: {str(e)}")
+            return False
+
+    def handle_otpcheck_output(self, stdout, stderr):
+        self.handling_flag = 1
+
+        if "No such file or directory" in stderr:
+            error_msg = "ERROR: No OTP file found on device\n"
+            self.console_output.append("!!! CRITICAL ERROR !!!\n")
+            self.console_output.append(error_msg)
+            QMessageBox.critical(self, "OTP Error",
+                                 "No OTP file found on device!\n\n"
+                                 "Please check if the device has proper OTP configuration.\n"
+                                 "Expected file: /dev/otp/APPOTP")
+            return False
+
+        parsed_data = self.parse_ssh_output(stdout)
+
+        # Compare OTP programmed values with GUI entered values
+        gui_pcb_pn = self.pcb_pn_input.text().strip()
+        gui_pcb_sn = self.pcb_sn_input.text().strip()
+        gui_assy_pn = self.assembly_pn_input.text().strip()
+        gui_assy_sn = self.assembly_sn_input.text().strip()
+
+        otp_pcb_pn = parsed_data.get('pcb_part_number', '')
+        otp_pcb_pn = otp_pcb_pn.split('_')[0] if otp_pcb_pn else ''
+        otp_pcb_sn = parsed_data.get('pcb_serial_number', '')
+        otp_assy_pn = parsed_data.get('assembly_part_number', '')
+        otp_assy_sn = parsed_data.get('assembly_serial_number', '')
+
+        match_failures = []
+
+        if gui_pcb_pn and otp_pcb_pn and gui_pcb_pn != otp_pcb_pn:
+            match_failures.append(f"PCB Part Number mismatch (GUI: {gui_pcb_pn} vs OTP: {otp_pcb_pn})")
+
+        if gui_pcb_sn and otp_pcb_sn and gui_pcb_sn != otp_pcb_sn:
+            match_failures.append(f"PCB Serial Number mismatch (GUI: {gui_pcb_sn} vs OTP: {otp_pcb_sn})")
+
+        if gui_assy_pn and otp_assy_pn and gui_assy_pn != otp_assy_pn:
+            match_failures.append(f"Assembly Part Number mismatch (GUI: {gui_assy_pn} vs OTP: {otp_assy_pn})")
+
+        if gui_assy_sn and otp_assy_sn and gui_assy_sn != otp_assy_sn:
+            match_failures.append(f"Assembly Serial Number mismatch (GUI: {gui_assy_sn} vs OTP: {otp_assy_sn})")
+
+        if match_failures:
+            error_msg = "OTP Programming Verification Failed:\n" + "\n".join(match_failures)
+            self.append_console_message("!!! OTP PROGRAMMING ERROR !!!\n", is_error=True)
+            self.append_console_message(error_msg + "\n", is_error=True)
+            self.test_result = 'FAIL'
+            return False
+        else:
+            success_msg = "OTP Programming Verified Successfully!\n"
+            success_msg += f"PCB Part Number: {otp_pcb_pn}\n"
+            success_msg += f"PCB Serial Number: {otp_pcb_sn}\n"
+            success_msg += f"Assembly Part Number: {otp_assy_pn}\n"
+            success_msg += f"Assembly Serial Number: {otp_assy_sn}\n"
+
+            # self.append_console_message("=== OTP VERIFICATION SUCCESS ===\n")
+            self.append_console_message(success_msg)
+            # QMessageBox.information(self, "OTP Verified", success_msg)
+            return True
+
+    def handle_firmare_check_output(self, stdout, sterr):
+        parsed_data = self.parse_ssh_output(stdout)
+        Actual_version = parsed_data['firmware_version']
+        Expected_version = self.config["expected_firmware_version"]
+        if Actual_version == Expected_version:
+            self.Firmware_check = True
+            self.append_console_message(
+                f"✔ Correct version: {Expected_version}")
+        else:
+            error_msg = "Firmware Mismatch Test cannot be proceed further please update the latest Firmware"
+            self.Firmware_check = False
+            self.append_console_message(
+                f"✖ Incorrect version (expected: {Expected_version} Actual: {Actual_version})",
+                is_error=True
+            )
+            QMessageBox.critical(self, "Firmware Version Mismatch", error_msg)
+            self.test_result = 'FAIL'
+
+    def handle_self_test_output(self, stdout, sterr):
+        test_passed = "Self Test PASS" in stdout
+        test_details = stdout.strip()
+
+        if "Error in slave initialization" in  test_details:
+            QMessageBox.critical(
+                self,
+                "Critical Error",
+                "Slave initialization failed! Please check the EtherCAT connection and restart the test."
+            )
+            self.test_status_label_start.setText("Failed")
+
+
+        if test_passed:
+            self.append_self_message("SELF TEST PASS")
+            self.test_status_label_start.setText("● Completed — PASS")
+            self.test_status_label_start.setStyleSheet(self._PILL_PASS_SS)
+        else:
+            self.append_self_message("SELF TEST FAIL", is_error=True)
+            self.over_all_result = "FAIL"
+            self.test_status_label_start.setText("● Completed — FAIL")
+            self.test_status_label_start.setStyleSheet(self._PILL_FAIL_SS)
+
+        # Log to Excel
+        #unit_identifier = f"{self.assembly_pn_input.text().strip()} ({self.assembly_sn_input.text().strip()})"
+        self.excel_logger.log_self_test(
+            unit_identifier="self_test",
+            test_passed=test_passed,
+            test_details=test_details,
+            notes="Self Test completed"
+        )
+
+        self.excel_logger.log_summary(
+            metadata={
+                'end_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                'overall_result': self.over_all_result
+            }
+        )
+
+        return test_passed
+
+    def check_output_for_strings(self, stdout):
+        """Check the output for specific strings and return findings"""
+        results = {
+            'compilation_success': False,
+            'pdo_map_success': False,
+        }
+
+        # Check for successful compilation
+        if "Ethercat compiled Sucessfully" in stdout:
+            results['compilation_success'] = True
+
+        # Check for PDO map completion
+        if "pdo map successfully reached end" in stdout:
+            results['pdo_map_success'] = True
+
+        return results
+
+    # Example usage in your handle_soemcompile_output method:
+    def handle_soemcompile_output(self, stdout, stderr):
+        self.handling_flag = 2
+
+        # Analyze the output
+        analysis = self.check_output_for_strings(stdout)
+
+        # Check for specific conditions
+        if not analysis['compilation_success']:
+            error_msg = "ERROR: Ethercat compilation failed\n"
+            self.append_console_message("!!! CRITICAL ERROR !!!\n", is_error=True)
+            self.append_console_message(error_msg, is_error=True)
+            QMessageBox.critical(self, "Compilation Error", error_msg)
+            self.test_result = 'FAIL'
+            return False
+
+        if not analysis['pdo_map_success']:
+            error_msg = "ERROR: PDO Map generation failed\n"
+            self.append_console_message("!!! CRITICAL ERROR !!!\n", is_error=True)
+            self.append_console_message(error_msg, is_error=True)
+            QMessageBox.critical(self, "PDO Map Error", error_msg)
+            self.test_result = 'FAIL'
+            return False
+
+        if "Ethercat compiled Sucessfully" in stdout and "pdo map successfully reached end" in stdout:
+            success_msg = "Ethercat compiled Successfully with PDO mapping"
+            self.append_console_message(success_msg)
+            self.check = True
+            return True
+
+        return False
+
+    def handle_slaveinfo_output(self, stdout, stderr):
+        Counter = 0
+        if not self.check:
+            return False
+
+        self.handling_flag = 3
+        parsed_data = self.parse_ssh_output(stdout)
+
+        if len(parsed_data['product_id']) == 0 or parsed_data['product_id'] is None:
+            self.append_console_message(" Error : Product ID is None", is_error=True)
+            Counter = 1
+        if len(parsed_data['esi_revision']) == 0 or parsed_data['esi_revision'] is None:
+            self.append_console_message(" Error : ESI Revision is None", is_error=True)
+            Counter = 1
+        if len(parsed_data['ethercat_address']) == 0 or parsed_data['ethercat_address'] is None:
+            self.append_console_message(" Error : Ethercat Address is None", is_error=True)
+            Counter = 1
+
+        if int(parsed_data['ethercat_address'],16) !=  int('0x444',16) :
+            Address = parsed_data['ethercat_address']
+            self.append_console_message(f" Error : Ethercat Address Failed Actual_Value = {Address} Expected_Value = 0X444  ", is_error=True)
+            self.append_console_message(f"Set hex switch to 0x444 and Power Cycle and restart the test", is_error=True)
+            Counter = 1
+
+        self.product_id.setText(parsed_data['product_id'])
+        self.esi_revision.setText(parsed_data['esi_revision'])
+        self.firmware_version.setText(parsed_data['firmware_version'])
+        self.ethercat_address.setText(parsed_data['ethercat_address'])
+
+        if Counter == 0:
+            self.append_console_message("Slave Information Test Passed")
+        else:
+            self.append_console_message("Slave Information Test Fail", is_error=True)
+            self.test_result = 'FAIL'
+
+        return True
+
+    def create_form_row(self, label, widget, layout, readonly=False):
+        """Create a responsive form row"""
+        row = QWidget()
+        row_layout = QVBoxLayout(row)
+        row_layout.setContentsMargins(0, 0, 0, 0)
+        row_layout.setSpacing(2)
+
+        lbl = QLabel(label)
+        lbl.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        row_layout.addWidget(lbl)
+
+        if isinstance(widget, (QLineEdit, QDateEdit)):
+            widget.setMinimumHeight(30)  # Reduced from 38 for better scaling
+            if readonly:
+                widget.setReadOnly(True)
+                if isinstance(widget, QLineEdit):
+                    widget.setStyleSheet("""
+                              background-color: #e0e0e0;
+                              color: #495057;
+                              border: 1px solid #000000;
+                              font-weight: bold;
+                          """)
+
+        widget.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        row_layout.addWidget(widget)
+        layout.addWidget(row)
+        return widget
+
+    def _create_Impedance_zone_panel(self, zone_name):
+        """Create a responsive impedance zone panel"""
+        panel = QGroupBox(zone_name)
+
+        panel.setStyleSheet("""
+              QGroupBox {
+                  font-weight: bold; font-size: 9pt; color: white;
+                  border: 2px solid rgba(255,255,255,0.35); border-radius: 6px;
+                  margin-top: 20px; padding-top: 20px;
+                  background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                      stop:0 #004D40, stop:1 #00352c);
+              }
+              QGroupBox::title {
+                  subcontrol-origin: margin; subcontrol-position: top center;
+                  padding: 2px 8px; color: white; background-color: #004D40;
+              }
+          """)
+
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setSpacing(10)
+        panel_layout.setContentsMargins(8, 15, 8, 8)
+
+        # Create measurement table with scroll area
+        table_scroll = QScrollArea()
+        table_scroll.setWidgetResizable(True)
+        table_scroll.setMinimumHeight(200)
+
+        measurement_table = QTableWidget(1 if zone_name == "Zone1-Inner" else len(self._relay_values_imp), 5)
+        measurement_table.setHorizontalHeaderLabels(["Setpt", "R", "I", "Z", "P/F"])
+        measurement_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        measurement_table.verticalHeader().setVisible(False)
+        measurement_table.setFont(QFont('Arial', 9))
+
+        # Style the table
+        measurement_table.setStyleSheet("""
+              QTableWidget {
+                  background-color: #0d1117;
+                  color: #c9d1d9;
+                  gridline-color: #30363d;
+                  border: none;
+              }
+              QHeaderView::section {
+                  background-color: #1f2937;
+                  color: #7dd3fc;
+                  padding: 4px;
+                  border: 1px solid #30363d;
+                  font-weight: bold;
+              }
+              QTableWidget::item {
+                  background-color: #161b22;
+              }
+          """)
+
+        # Populate setpoint values
+        if zone_name == "Zone1-Inner":
+            measurement_table.setItem(0, 0, QTableWidgetItem(str(self._relay_values_imp[0])))
+        else:
+            for row, relay in enumerate(self._relay_values_imp):
+                measurement_table.setItem(row, 0, QTableWidgetItem(str(relay)))
+
+        table_scroll.setWidget(measurement_table)
+        panel_layout.addWidget(table_scroll)
+
+        # Add test button
+        test_button = QPushButton(f"▶  Test {zone_name}")
+        test_button.setFont(QFont('Arial', 9, QFont.Bold))
+        test_button.setFixedHeight(32)
+        test_button.setCursor(Qt.PointingHandCursor)
+        test_button.setStyleSheet("""
+              QPushButton {
+                  background-color: #00695C; color: white; border: none;
+                  border-radius: 4px; padding: 4px 8px;
+              }
+              QPushButton:hover   { background-color: #004D40; }
+              QPushButton:pressed { background-color: #003d31; }
+          """)
+        test_button.clicked.connect(lambda _, z=zone_name: self._start_impedance_zone_measurement(z))
+        panel_layout.addWidget(test_button, alignment=Qt.AlignCenter)
+
+        self._measurement_tables_imp[zone_name] = measurement_table
+
+        return panel
+
+    def _create_resistance_zone_panel(self, zone_name):
+        """Create a responsive resistance zone panel"""
+        panel = QGroupBox(zone_name)
+
+        panel.setStyleSheet("""
+               QGroupBox {
+                   font-weight: bold; font-size: 9pt; color: white;
+                   border: 2px solid rgba(255,255,255,0.35); border-radius: 6px;
+                   margin-top: 20px; padding-top: 20px;
+                   background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                       stop:0 #311B92, stop:1 #1a0f5c);
+               }
+               QGroupBox::title {
+                   subcontrol-origin: margin; subcontrol-position: top center;
+                   padding: 2px 8px; color: white; background-color: #311B92;
+               }
+           """)
+
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setSpacing(10)
+        panel_layout.setContentsMargins(8, 15, 8, 8)
+
+        # Create measurement table with scroll area
+        table_scroll = QScrollArea()
+        table_scroll.setWidgetResizable(True)
+        table_scroll.setMinimumHeight(200)
+
+        measurement_table = QTableWidget(1 if zone_name == "Zone1-Inner" else len(self._relay_values), 3)
+        measurement_table.setHorizontalHeaderLabels(["Setpt", "R", "P/F"])
+        measurement_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        measurement_table.verticalHeader().setVisible(False)
+        measurement_table.setFont(QFont('Arial', 9))
+
+        # Style the table
+        measurement_table.setStyleSheet("""
+               QTableWidget {
+                   background-color: #0d1117;
+                   color: #c9d1d9;
+                   gridline-color: #30363d;
+                   border: none;
+               }
+               QHeaderView::section {
+                   background-color: #1f2937;
+                   color: #c4b5fd;
+                   padding: 4px;
+                   border: 1px solid #30363d;
+                   font-weight: bold;
+               }
+               QTableWidget::item {
+                   background-color: #161b22;
+               }
+           """)
+
+        # Populate setpoint values
+        if zone_name == "Zone1-Inner":
+            measurement_table.setItem(0, 0, QTableWidgetItem(str(self._relay_values[0])))
+        else:
+            for row, relay in enumerate(self._relay_values):
+                measurement_table.setItem(row, 0, QTableWidgetItem(str(relay)))
+
+        table_scroll.setWidget(measurement_table)
+        panel_layout.addWidget(table_scroll)
+
+        # Add test button
+        test_button = QPushButton(f"▶  Test {zone_name}")
+        test_button.setFont(QFont('Arial', 9, QFont.Bold))
+        test_button.setFixedHeight(32)
+        test_button.setCursor(Qt.PointingHandCursor)
+        test_button.setStyleSheet("""
+               QPushButton {
+                   background-color: #4527A0; color: white; border: none;
+                   border-radius: 4px; padding: 4px 8px;
+               }
+               QPushButton:hover   { background-color: #311B92; }
+               QPushButton:pressed { background-color: #200d6b; }
+           """)
+        test_button.clicked.connect(lambda _, z=zone_name: self._start_resistance_zone_measurement(z))
+        panel_layout.addWidget(test_button, alignment=Qt.AlignCenter)
+
+        self._measurement_tables[zone_name] = measurement_table
+
+        return panel
+
+    def _clear_resistance_log_display(self):
+        self._log_output.clear()
+
+    def _clear_impedance_log_display(self):
+        self._log_output_imp.clear()
+
+    def get_table_item_safe(table, row, column):
+        item = table.item(row, column)
+        return item.text() if item is not None else ""
+
+    def _get_zone_title(self, zone_name):
+
+        zone_titles = {
+            "Zone1-Inner": "Zone 1 - Inner",
+            "Zone2-Mid_Inner": "Zone 2 - Mid Inner",
+            "Zone3-Mid_Edge": "Zone 3 - Mid Edge",
+            "Zone4-Edge": "Zone 4 - Edge",
+            "Zone5-Outer": "Zone 5 - Outer"
+        }
+        return zone_titles.get(zone_name, zone_name)
+
+    def process_single_measurement(self, zone_name, measurement_line):
+        """
+        Process single measurement line from RPi in format: setpoint,resistance,status
+        Example: "0,2.5,True"
+        """
+        try:
+            # Remove any whitespace and split the components
+            # setpoint, resistance, status = measurement_line.strip().split(',')
+            val = measurement_line.strip().split(',')
+            if len(val) < 4:
+                self._log_resistance_message(f"Invalid measurement format (expected 4+ fields): {measurement_line}", is_error=True)
+                return False
+            setpoint = val[1]
+            resistance = val[2]
+            status = val[3]
+            # Find the table for this zone
+            table = self._measurement_tables.get(zone_name)
+            self.config1 = self.load_config(self.assembly_suffix)
+
+            if not table:
+                self._log_resistance_message(f"No table found for zone {zone_name}", is_error=True)
+                return False
+
+            # Find the row with matching setpoint
+            for row in range(table.rowCount()):
+                #self._log_resistance_message(f"Inside block1 ", is_error=True)
+                if table.item(row, 0).text() == setpoint:
+
+                    #self._log_resistance_message(f"Inside block2 {table.item(row, 0).text()}", is_error=True)
+                    # Convert status to display format
+                    status_text = "PASS" if status.lower() == "true" else "FAIL"
+                    measurement_data = {
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'zone_title': self._get_zone_title(zone_name),
+                        'setpoint': float(setpoint),
+                        'resistance': float(resistance),
+                        'status': "PASS" if status.lower() == "true" else "FAIL",
+                        'table_row': row + 1
+                    }
+
+                    if status == 'False':
+                        self.resistance_test = 'FAIL'
+                        self.over_all_result = 'FAIL'
+
+                    self.step_no = self.step_no + 1
+                    if float(setpoint) != 0.0:
+                        limit_per = float(self.config1[setpoint])
+                        prod_val = float(self.config1[f'Res{setpoint}'])
+                        higher_limit = prod_val + (prod_val * limit_per / 100)
+                        lower_limit = prod_val - (prod_val * limit_per / 100)
+                        #self._log_resistance_message(f"Inside block3", is_error=True)
+                        # Log metadata along with test data
+                        self.excel_logger.log_summary(
+                            step_data={
+                                'step': str(self.step_no),
+                                'unit': 'ohm',
+                                'low_limit': f'{lower_limit}',
+                                'measure': f'{float(resistance)}',
+                                'high_limit': f'{higher_limit}',
+                                'teststep': 'Resistance Test',
+                                'testpoints': f'{self._get_zone_title(zone_name)}_{setpoint}',
+                                'status': "PASS" if status.lower() == "true" else "FAIL"
+                            }
+                        )
+                    else:
+                        self.excel_logger.log_summary(
+                            step_data={
+                                'step': str(self.step_no),
+                                'unit': 'ohm',
+                                'low_limit': '0.0',
+                                'measure': f'{float(resistance)}',
+                                'high_limit': '0.7',
+                                'teststep': 'Resistance Test',
+                                'testpoints': f'{self._get_zone_title(zone_name)}_{setpoint}',
+                                'status': "PASS" if status.lower() == "true" else "FAIL"
+                            }
+                        )
+
+                    #if self._get_zone_title(zone_name) == "Zone 5 - Outer" and float(setpoint) == 127.0:
+
+                    #self._log_resistance_message(f"Inside block4", is_error=True)
+                    self.excel_logger.log_summary(
+                            metadata={
+                                'end_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                'overall_result': self.over_all_result
+                            }
+                        )
+                    self.excel_logger.update_overall_result(self.over_all_result)
+
+                    #self._log_resistance_message(f"Inside block5", is_error=True)
+                    # Update the table
+                    self.update_resistance_measurement(
+                        zone_name,
+                        row,
+                        float(resistance),
+                        status_text
+                    )
+
+                    #self._log_resistance_message(f"Inside block6", is_error=True)
+                    # Log to Excel (combined sheet)
+                    if not self.excel_logger.log_resistance_measurement(measurement_data, f'{zone_name}_Res_scan'):
+                        raise Exception("Failed to log to Excel")
+                    return True
+
+            self._log_resistance_message(f"Setpoint {setpoint} not found in {zone_name}", is_error=True)
+            return False
+
+        except ValueError:
+            self._log_resistance_message(f"Invalid measurement format: {measurement_line}", is_error=True)
+            return False
+        except Exception as e:
+            self._log_resistance_message(f"Error processing measurement: {str(e)}", is_error=True)
+            return False
+
+    def _start_impedance_zone_measurement(self, zone_name):
+
+        try:
+
+            self.names1 = zone_name
+            self.stop_increment = False
+            selected_freq = self.freq_combo.currentText()
+            frequency = selected_freq.split()[0]
+            freq_suffix = ExcelLogger._freq_to_sheet_suffix(selected_freq)
+            if selected_freq == "60 MHz":
+                command = f"{zone_name} 50000 70000"
+            else:
+                command = f"{zone_name} {frequency}"
+
+
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Information)
+            msg.setText(f"Please connect Zone {zone_name} and click OK to continue")
+            msg.setWindowTitle("Impedance Scan")
+            msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            retval = msg.exec_()
+            if retval == QMessageBox.Ok:
+                self.start_time = time.time()
+                if zone_name == "Zone1-Inner":
+                    if self.Zone1_Inner_imp >= 1:
+                        excel_logger.reset_sheet(f"Zone1-Inner_{freq_suffix}_Imp_scan")
+                        self.stop_increment =  True
+                    self.Zone1_Inner_imp += 1
+
+                elif zone_name == "Zone2-Mid_Inner":
+                    if self.Zone2_Mid_Inner_imp >= 1:
+                        excel_logger.reset_sheet(f"Zone2-Mid_Inner_{freq_suffix}_Imp_scan")
+                        self.stop_increment = True
+                    self.Zone2_Mid_Inner_imp += 1
+
+                elif zone_name == "Zone3-Mid_Edge":
+                    if self.Zone3_Mid_Edge_imp >= 1:
+                        excel_logger.reset_sheet(f"Zone3-Mid_Edge_{freq_suffix}_Imp_scan")
+                        self.stop_increment = True
+                    self.Zone3_Mid_Edge_imp += 1
+
+                elif zone_name == "Zone4-Edge":
+                    if self.Zone4_Edge_imp >= 1:
+                        excel_logger.reset_sheet(f"Zone4-Edge_{freq_suffix}_Imp_scan")
+                        self.stop_increment = True
+                    self.Zone4_Edge_imp += 1
+
+                elif zone_name == "Zone5-Outer":
+                    if self.Zone5_Outer_imp >= 1:
+                        excel_logger.reset_sheet(f"Zone5-Outer_{freq_suffix}_Imp_scan")
+                        self.stop_increment = True
+                    self.Zone5_Outer_imp += 1
+
+                else:
+                    pass
+
+                if hasattr(self, 'worker') and self.worker:
+                    self.worker.stop()
+                if selected_freq == "60 MHz":
+                    script_path = '/home/robot/Manufacturing_test/aipc_beta/VNA_start_stop_60Mhz.py'
+                else:
+                    script_path = '/home/robot/Manufacturing_test/aipc_beta/VNA_Final.py'
+                self.worker = Worker(
+                    self.ssh_handler,
+                    script_path,
+                    command
+                )
+
+
+
+
+
+
+
+
+                self.worker.output_ready.connect(self.handle_Zone_impedance_output)
+                self.worker.error_occurred.connect(self.handle_imp_error)
+                # Start the thread
+                self.worker.start()
+                self._log_Impedance_message(f"Starting measurement for {zone_name}")
+            else:
+                self._log_Impedance_message(f"Impedance Scan {zone_name} suspended,is_error= True")
+
+
+        except Exception as e:
+            self._log_Impedance_message(f"Failed to start test: {str(e)}", is_error=True)
+            self.cleanup_resources()
+
+
+    def handle_imp_error(self, error_msg):
+        self._log_Impedance_message(f"ERROR: {error_msg}", is_error=True)
+        self.cleanup_resources()
+
+    def handle_config_test(self):
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.stop()
+
+        # Raspberry Pi SSH details
+        #host = "192.168.1.2"  # Replace with your Pi's IP
+        host = "10.119.9.225"
+        #host =
+        username = "robot"
+        password = "robot"  # Default, change if needed
+
+        # File paths
+        local_file = "C:\\Config\\config.json"  # Windows path
+        remote_file = "/home/robot/Manufacturing_test/aipc_beta/config.json"  # Destination on Pi
+
+        # Initialize SSH client
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(host, username=username, password=password)
+
+        # Transfer file using SFTP
+        sftp = ssh.open_sftp()
+        sftp.put(local_file, remote_file)
+        sftp.close()
+        ssh.close()
+
+
+    def file_transer(self,local_file,remote_file):
+        if hasattr(self, 'worker') and self.worker:
+            self.worker.stop()
+
+        # Raspberry Pi SSH details
+        #host = "192.168.1.2"  # Replace with your Pi's IP
+        host = "10.119.9.225"
+        username = "robot"
+        password = "robot"  # Default, change if needed
+        self.append_console_message("Transferring the APPOTP file to RPI")
+        # File paths
+        #local_file = "C:\\Config\\config.json"  # Windows path
+        #remote_file = "/home/robot/Manufacturing_test/aipc_beta/config.json"  # Destination on Pi
+
+        # Initialize SSH client
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.connect(host, username=username, password=password)
+
+        # Transfer file using SFTP
+        sftp = ssh.open_sftp()
+        sftp.put(local_file, remote_file)
+        sftp.close()
+        ssh.close()
+
+
+
+    def process_single_imp_measurement(self, zone_name, measurement_line):
+        """
+        Process single measurement line from RPi in format: setpoint,resistance,status
+        Example: "0,2.5,True"
+        """
+        try:
+            # Remove any whitespace and split the components
+            # setpoint, resistance, status = measurement_line.strip().split(',')
+            val = measurement_line.strip().split(',')
+            if len(val) < 6:
+                self._log_Impedance_message(f"Invalid measurement format (expected 6+ fields): {measurement_line}", is_error=True)
+                return False
+            setpoint = val[1]
+            real = val[2]
+            img = val[3]
+            imped = val[4]
+            status = val[5]
+            # Find the table for this zone
+            table = self._measurement_tables_imp.get(zone_name)
+            self.config2 = self.load_config(self.assembly_suffix)
+
+            if not table:
+                self._log_Impedance_message(f"No table found for zone {zone_name}", is_error=True)
+                return False
+
+            # Find the row with matching setpoint
+
+            for row in range(table.rowCount()):
+                if table.item(row, 0).text() == setpoint:
+                    # Convert status to display format
+                    status_text = "PASS" if status.lower() == "true" else "FAIL"
+                    measurement_data = {
+                        'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+                        'zone_title': zone_name,
+                        'Frequency': self.freq_combo.currentText(),
+                        'setpoint': setpoint,
+                        'Real': float(real),
+                        'Imag': float(img),
+                        'Z': float(imped),
+                        'status': "PASS" if status.lower() == "true" else "FAIL",
+                        'table_row': row + 1
+                    }
+
+
+                    if status == 'False':
+                        self.Impedance_test = 'FAIL'
+                        self.over_all_result = 'FAIL'
+
+                    self.step_no = self.step_no + 1
+                    freq_suffix = ExcelLogger._freq_to_sheet_suffix(self.freq_combo.currentText())
+                    if float(setpoint) != 0.0:
+                        limit_per = float(self.config2[setpoint])
+                        prod_val = float(self.config2[zone_name][setpoint])
+                        higher_limit = prod_val + (prod_val * limit_per / 100)
+                        lower_limit = prod_val - (prod_val * limit_per / 100)
+
+                        # Log metadata along with test data
+                        step_data_dict = {
+                            'step': str(self.step_no),
+                            'unit': 'ohm',
+                            'low_limit': f'{lower_limit}',
+                            'measure': f'{float(imped)}',
+                            'high_limit': f'{higher_limit}',
+                            'teststep': 'Impedance Test',
+                            'testpoints': f'{zone_name}_{setpoint}_{self.freq_combo.currentText()}',
+                            'status': "PASS" if status.lower() == "true" else "FAIL"
+                        }
+                        self.excel_logger.log_summary(step_data=step_data_dict)
+                    else:
+                        step_data_dict = {
+                            'step': str(self.step_no),
+                            'unit': 'ohm',
+                            'low_limit': '0.0',
+                            'measure': f'{float(imped)}',
+                            'high_limit': '0.7',
+                            'teststep': 'Impedance Test',
+                            'testpoints': f'{zone_name}_{setpoint}_{self.freq_combo.currentText()}',
+                            'status': "PASS" if status.lower() == "true" else "FAIL"
+                        }
+                        self.excel_logger.log_summary(step_data=step_data_dict)
+
+                    #if zone_name == "Zone5-Outer" and float(setpoint) == 143.0:
+                    """
+                    self.excel_logger.log_summary(
+                            teststep_data={
+                                'teststep': 'Impedance Test',
+                                'status': self.Impedance_test
+                            })
+
+                    self.excel_logger.log_summary(
+                            metadata={
+                                'end_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                                'overall_result': self.over_all_result
+                            }
+                        )
+                    """
+                    self.excel_logger.update_overall_result(self.over_all_result)
+                    # Update the table
+                    self.update_impedance_measurement(
+                        zone_name,
+                        row,
+                        float(real),
+                        float(img),
+                        float(imped),
+                        status_text
+                    )
+                    # Log to Excel (frequency-specific combined sheet)
+                    if not self.excel_logger.log_Imp_measurement(measurement_data, f'{zone_name}_{freq_suffix}_Imp_scan'):
+                        raise Exception("Failed to log to Excel")
+                    return True
+
+            self._log_Impedance_message(f"Setpoint {setpoint} not found in {zone_name}", is_error=True)
+            return False
+
+        except ValueError:
+            self._log_Impedance_message(f"Invalid measurement format: {measurement_line}", is_error=True)
+            return False
+        except Exception as e:
+            self._log_Impedance_message(f"Error processing measurement: {str(e)}", is_error=True)
+            return False
+
+    def _log_Impedance_message(self, message, is_error=False):
+        if is_error:
+            self._log_output_imp.append(f'<span style="color:#f85149; font-weight:bold;">{message}</span>')
+        else:
+            self._log_output_imp.append(f'<span style="color:#3fb950; font-weight:bold;">{message}</span>')
+
+        self._log_output_imp.verticalScrollBar().setValue(
+            self._log_output_imp.verticalScrollBar().maximum()
+        )
+
+    def handle_Zone_impedance_output(self, line):
+        # self._log_resistance_message(f"{line}")
+        # self._log_Impedance_message(f"{line}")
+        # self._log_Impedance_message(self.names1)
+        if "pyvisa.errors" in line:
+            QMessageBox.critical(
+                self,
+                "PyVISA Error",
+                f"A PyVISA error occurred: {line.strip()}"
+            )
+            self.worker.stop()
+            return
+
+        if "No data found for frequencies" in line:
+            self._log_Impedance_message(line.strip(), is_error=True)
+            self.worker.stop()
+            return
+
+        if self.names1 in line:
+            self._log_Impedance_message(f"Starting measurement for {line}")
+
+            # Process the single measurement line
+            if line.strip():
+                if not self.process_single_imp_measurement(self.names1, line):
+                    self._log_Impedance_message("Failed to process measurement", is_error=True)
+            else:
+                self._log_Impedance_message("No measurement data received", is_error=True)
+
+        if "Error in slave initialization" in line:
+            QMessageBox.critical(
+                self,
+                "Critical Error",
+                "Slave initialization failed! Please check the EtherCAT connection and restart the test."
+            )
+            self.worker.stop()
+
+        if "no ping" in line:
+            self._log_Impedance_message(f"VNA not connected to the Network", is_error= True)
+            self.worker.stop()
+
+        if "Test_done" in line:
+            self._log_Impedance_message(f"============{self.names1} test completed =====")
+            self.worker.stop()
+        if time.time() - self.start_time > 300:
+            self._log_Impedance_message(
+                f"===No Data from Raspberry pi for more than 30 sec please check the Raspberry pi =====", is_error=True)
+            self.worker.stop()
+
+    def update_impedance_measurement(self, zone_name, row_index, real, imag, Imp, status):
+        """Update a single measurement in the table"""
+        if zone_name in self._measurement_tables_imp:
+            table = self._measurement_tables_imp[zone_name]
+            if 0 <= row_index < table.rowCount():
+                # Update resistance value (3 decimal places)
+                real_item = QTableWidgetItem(f"{real:.2f}")
+                real_item.setFlags(real_item.flags() ^ Qt.ItemIsEditable)
+                table.setItem(row_index, 1, real_item)
+
+                image_item = QTableWidgetItem(f"{imag:.2f}")
+                image_item.setFlags(image_item.flags() ^ Qt.ItemIsEditable)
+                table.setItem(row_index, 2, image_item)
+
+                Imp_item = QTableWidgetItem(f"{Imp:.2f}")
+                Imp_item.setFlags(Imp_item.flags() ^ Qt.ItemIsEditable)
+                table.setItem(row_index, 3, Imp_item)
+
+                # Update status with appropriate coloring
+                status_item = QTableWidgetItem(status)
+                status_item.setFlags(status_item.flags() ^ Qt.ItemIsEditable)
+
+                if status == "PASS":
+                    status_item.setBackground(QColor(220, 255, 220))  # Light green
+                    status_item.setForeground(QColor(0, 128, 0))  # Dark green text
+                else:
+                    status_item.setBackground(QColor(255, 220, 220))  # Light red
+                    status_item.setForeground(QColor(139, 0, 0))  # Dark red text
+
+                table.setItem(row_index, 4, status_item)
+
+                # Scroll to show the updated row
+                table.scrollToItem(table.item(row_index, 0))
+
+    def _start_resistance_zone_measurement(self, zone_name):
+        try:
+            self.names = zone_name
+            msg = QMessageBox()
+            msg.setIcon(QMessageBox.Information)
+            msg.setText(f"Please connect Zone {zone_name} and click OK to continue")
+            msg.setWindowTitle("Resistance Scan")
+            msg.setStandardButtons(QMessageBox.Ok | QMessageBox.Cancel)
+            retval = msg.exec_()
+            if retval == QMessageBox.Ok:
+                self.start_time = time.time()
+                if zone_name == "Zone1-Inner":
+                    if self.Zone1_Inner_res >= 1:
+                        excel_logger.reset_sheet("Zone1-Inner_Res_scan")
+                    self.Zone1_Inner_res += 1
+
+                elif zone_name == "Zone2-Mid_Inner":
+                    if self.Zone2_Mid_Inner_res >= 1:
+                        excel_logger.reset_sheet("Zone2-Mid_Inner_Res_scan")
+                    self.Zone2_Mid_Inner_res += 1
+
+                elif zone_name == "Zone3-Mid_Edge":
+                    if self.Zone3_Mid_Edge_res >= 1:
+                        excel_logger.reset_sheet("Zone3-Mid_Edge_Res_scan")
+                    self.Zone3_Mid_Edge_res += 1
+
+                elif zone_name == "Zone4-Edge":
+                    if self.Zone4_Edge_res >= 1:
+                        excel_logger.reset_sheet("Zone4-Edge_Res_scan")
+                    self.Zone4_Edge_res += 1
+
+                elif zone_name == "Zone5-Outer":
+                    if self.Zone5_Outer_res >= 1:
+                        excel_logger.reset_sheet("Zone5-Outer_Res_scan")
+                    self.Zone5_Outer_res += 1
+
+                else:
+                    pass
+                if hasattr(self, 'worker') and self.worker:
+                    self.worker.stop()
+                self.worker = Worker(
+                    self.ssh_handler,
+                    '/home/robot/Manufacturing_test/aipc_beta/resistance_test.py',
+                    zone_name
+                )
+
+                self.worker.output_ready.connect(self.handle_Zone_output)
+                self.worker.error_occurred.connect(self.handle_res_error)
+                # Start the thread
+                self.worker.start()
+                self._log_resistance_message(f"Starting measurement for {zone_name}")
+
+            else:
+                self._log_resistance_message(f"Resistance Scan : {zone_name} suspended", is_error=True)
+
+        except Exception as e:
+            self._log_resistance_message(f"Failed to start test: {str(e)}", is_error=True)
+            self.cleanup_resources()
+
+
+    def handle_res_error(self, error_msg):
+        self._log_resistance_message(f"ERROR: {error_msg}", is_error=True)
+        self.cleanup_resources()
+
+
+    def handle_Zone_output(self, line):
+        # self._log_resistance_message(f"{line}")
+        if "pyvisa.errors" in line:
+            QMessageBox.critical(
+                self,
+                "PyVISA Error",
+                f"A PyVISA error occurred: {line.strip()}"
+            )
+            self.worker.stop()
+            return
+
+        if "no ping" in line:
+            self._log_Impedance_message(f"DIMM not connected to the Network", is_error=True)
+            self.worker.stop()
+
+        if "Error in slave initialization" in line:
+            QMessageBox.critical(
+                self,
+                "Critical Error",
+                "Slave initialization failed! Please check the EtherCAT connection and restart the test."
+            )
+            self.worker.stop()
+
+        if self.names in line:
+            self._log_resistance_message(f"Starting measurement for {line}")
+
+            # Process the single measurement line
+            if line.strip():
+                if not self.process_single_measurement(self.names, line):
+                    self._log_resistance_message("Failed to process measurement", is_error=True)
+            else:
+                self._log_resistance_message("No measurement data received", is_error=True)
+        if "Test_done" in line:
+            self._log_resistance_message(f"============{self.names} test completed =====")
+            self.worker.stop()
+        if time.time() - self.start_time > 150:
+            self._log_resistance_message(
+                f"===No Data from Raspberry pi for more than 90 sec please check the Raspberry pi =====", is_error=True)
+            self.worker.stop()
+
+
+    def update_resistance_measurement(self, zone_name, row_index, resistance_value, status):
+        """Update a single measurement in the table"""
+        if zone_name in self._measurement_tables:
+            table = self._measurement_tables[zone_name]
+            if 0 <= row_index < table.rowCount():
+                # Update resistance value (3 decimal places)
+                resistance_item = QTableWidgetItem(f"{resistance_value:.3f}")
+                resistance_item.setFlags(resistance_item.flags() ^ Qt.ItemIsEditable)
+                table.setItem(row_index, 1, resistance_item)
+
+                # Update status with appropriate coloring
+                status_item = QTableWidgetItem(status)
+                status_item.setFlags(status_item.flags() ^ Qt.ItemIsEditable)
+
+                if status == "PASS":
+                    status_item.setBackground(QColor(220, 255, 220))  # Light green
+                    status_item.setForeground(QColor(0, 128, 0))  # Dark green text
+                else:
+                    status_item.setBackground(QColor(255, 220, 220))  # Light red
+                    status_item.setForeground(QColor(139, 0, 0))  # Dark red text
+
+                table.setItem(row_index, 2, status_item)
+
+                # Scroll to show the updated row
+                table.scrollToItem(table.item(row_index, 0))
+
+
+    def _log_resistance_message(self, message, is_error=False):
+        if is_error:
+            self._log_output.append(f'<span style="color:#f85149; font-weight:bold;">{message}</span>')
+        else:
+            self._log_output.append(f'<span style="color:#3fb950; font-weight:bold;">{message}</span>')
+        self._log_output.verticalScrollBar().setValue(
+            self._log_output.verticalScrollBar().maximum()
+        )
+
+
+    # ================================================================== #
+    #  Shared design-system constants & helpers                           #
+    # ================================================================== #
+
+    _DARK_CONSOLE_SS = """
+        QTextBrowser {
+            background-color: #0d1117;
+            color: #c9d1d9;
+            border: 1px solid #30363d;
+            border-top: none;
+            border-bottom-left-radius: 4px;
+            border-bottom-right-radius: 4px;
+            font-family: 'Courier New', Consolas, monospace;
+            font-size: 10pt;
+            padding: 6px;
+            selection-background-color: #264f78;
+        }
+    """
+
+    _CONSOLE_HDR_SS = """
+        QLabel {
+            background-color: #343a40;
+            color: #adb5bd;
+            font-size: 8pt;
+            font-weight: bold;
+            padding: 4px 8px;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+        }
+    """
+
+    _PILL_READY_SS = (
+        "QLabel { background-color:#17a2b8; color:white; padding:6px 14px;"
+        " border-radius:14px; font-weight:bold; font-size:10pt; }"
+    )
+    _PILL_RUN_SS = (
+        "QLabel { background-color:#fd7e14; color:white; padding:6px 14px;"
+        " border-radius:14px; font-weight:bold; font-size:10pt; }"
+    )
+    _PILL_PASS_SS = (
+        "QLabel { background-color:#28a745; color:white; padding:6px 14px;"
+        " border-radius:14px; font-weight:bold; font-size:10pt; }"
+    )
+    _PILL_FAIL_SS = (
+        "QLabel { background-color:#dc3545; color:white; padding:6px 14px;"
+        " border-radius:14px; font-weight:bold; font-size:10pt; }"
+    )
+    _PILL_GRAY_SS = (
+        "QLabel { background-color:#6c757d; color:white; padding:6px 14px;"
+        " border-radius:14px; font-weight:bold; font-size:10pt; }"
+    )
+
+    _BTN_GREEN_SS = """
+        QPushButton {
+            background-color: #28a745; color: white; border: none;
+            border-radius: 5px; font-size: 10pt; font-weight: bold; padding: 6px 18px;
+        }
+        QPushButton:hover    { background-color: #218838; }
+        QPushButton:pressed  { background-color: #1e7e34; }
+        QPushButton:disabled { background-color: #94d3a2; color: #e9f7ed; }
+    """
+    _BTN_RED_SS = """
+        QPushButton {
+            background-color: #dc3545; color: white; border: none;
+            border-radius: 5px; font-size: 10pt; font-weight: bold; padding: 6px 18px;
+        }
+        QPushButton:hover    { background-color: #c82333; }
+        QPushButton:pressed  { background-color: #bd2130; }
+        QPushButton:disabled { background-color: #e8a5ac; color: #fce0e3; }
+    """
+    _BTN_TEAL_SS = """
+        QPushButton {
+            background-color: #17a2b8; color: white; border: none;
+            border-radius: 5px; font-size: 10pt; font-weight: bold; padding: 6px 18px;
+        }
+        QPushButton:hover    { background-color: #138496; }
+        QPushButton:pressed  { background-color: #117a8b; }
+        QPushButton:disabled { background-color: #8bd4df; color: #d9f3f7; }
+    """
+    _BTN_GRAY_SS = """
+        QPushButton {
+            background-color: #6c757d; color: white; border: none;
+            border-radius: 5px; font-size: 10pt; font-weight: bold; padding: 6px 18px;
+        }
+        QPushButton:hover    { background-color: #5a6268; }
+        QPushButton:pressed  { background-color: #4e555b; }
+        QPushButton:disabled { background-color: #adb5bd; color: #e9ecef; }
+    """
+    _BTN_PURPLE_SS = """
+        QPushButton {
+            background-color: #6f42c1; color: white; border: none;
+            border-radius: 5px; font-size: 10pt; font-weight: bold; padding: 6px 18px;
+        }
+        QPushButton:hover    { background-color: #5e35b1; }
+        QPushButton:pressed  { background-color: #512da8; }
+        QPushButton:disabled { background-color: #c3a8e8; color: #f1ebfc; }
+    """
+
+    _PROGRESS_SS = """
+        QProgressBar {
+            border: 1px solid #adb5bd; border-radius: 5px; background-color: #e9ecef;
+            text-align: center; font-size: 8pt; color: #343a40;
+        }
+        QProgressBar::chunk {
+            background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                stop:0 #28a745, stop:1 #20c997);
+            border-radius: 5px;
+        }
+    """
+
+    _ZONE_PANEL_SS = """
+        QGroupBox {
+            font-weight: bold; font-size: 9pt; color: #fff;
+            border: none; border-radius: 6px;
+            margin-top: 8px; padding-top: 14px;
+            background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #1565C0, stop:1 #0d47a1);
+        }
+        QGroupBox::title {
+            subcontrol-origin: margin; subcontrol-position: top center;
+            padding: 0 8px; color: white;
+        }
+    """
+
+    _STATE_IDLE_SS = """
+        QLabel {
+            background-color: #e9ecef; color: #6c757d;
+            border: 2px solid #ced4da; border-radius: 6px;
+            font-size: 11pt; font-weight: bold; padding: 10px 20px;
+        }
+    """
+    _STATE_OPEN_SS = """
+        QLabel {
+            background-color: #dc3545; color: white;
+            border: 2px solid #c82333; border-radius: 6px;
+            font-size: 11pt; font-weight: bold; padding: 10px 20px;
+        }
+    """
+    _STATE_CLOSED_SS = """
+        QLabel {
+            background-color: #28a745; color: white;
+            border: 2px solid #218838; border-radius: 6px;
+            font-size: 11pt; font-weight: bold; padding: 10px 20px;
+        }
+    """
+
+    def _make_tab_header(self, title, subtitle, color1="#1565C0", color2="#0288D1"):
+        """Return a styled gradient header QFrame for any tab."""
+        header = QFrame()
+        header.setMinimumHeight(52)
+        header.setStyleSheet(f"""
+            QFrame {{
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+                    stop:0 {color1}, stop:1 {color2});
+                border-radius: 6px;
+            }}
+        """)
+        hdr_l = QVBoxLayout(header)
+        hdr_l.setContentsMargins(16, 8, 16, 8)
+        hdr_l.setSpacing(2)
+        t = QLabel(title)
+        t.setWordWrap(True)
+        t.setStyleSheet(
+            "color: white; font-size: 14pt; font-weight: bold; background: transparent;"
+        )
+        hdr_l.addWidget(t)
+        return header
+
+    def _make_status_pill(self, text="● Test: Ready"):
+        """Return a teal 'Ready' status pill label."""
+        lbl = QLabel(text)
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setMinimumWidth(170)
+        lbl.setStyleSheet(self._PILL_READY_SS)
+        return lbl
+
+    def _make_action_button(self, text, style_ss, min_height=38, min_width=150):
+        """Return a consistently styled action button."""
+        btn = QPushButton(text)
+        btn.setMinimumHeight(min_height)
+        btn.setMinimumWidth(min_width)
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(style_ss)
+        return btn
+
+    def _make_controls_row(self, pill, *buttons):
+        """Return an QHBoxLayout: pill | stretch | buttons..."""
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        row.addWidget(pill)
+        row.addStretch()
+        for btn in buttons:
+            row.addWidget(btn)
+        return row
+
+    def _make_styled_progress(self, fmt="%p%", rng=(0, 100)):
+        """Return a gradient styled QProgressBar."""
+        pb = QProgressBar()
+        pb.setRange(*rng)
+        pb.setValue(0)
+        pb.setFormat(fmt)
+        pb.setMinimumHeight(22)
+        pb.setStyleSheet(self._PROGRESS_SS)
+        return pb
+
+    def _make_console_header(self, text="  Test Output"):
+        """Return the dark bar label placed above the dark console."""
+        lbl = QLabel(text)
+        lbl.setStyleSheet(self._CONSOLE_HDR_SS)
+        return lbl
+
+    def _make_dark_console(self, min_height=450, max_height=1500):
+        """Return a styled dark QTextBrowser terminal widget."""
+        c = QTextBrowser()
+        c.setMinimumHeight(min_height)
+        c.setMaximumHeight(max_height)
+        c.setStyleSheet(self._DARK_CONSOLE_SS)
+        return c
+
+    # ================================================================== #
+
+    def create_test_tab(self, title, show_progress=False):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(10)
+
+        test_section = QGroupBox()
+        test_section.setStyleSheet("""
+                QGroupBox {
+                    background-color: white;
+                    padding: 15px;
+                    border-radius: 5px;
+                }
+                QGroupBox::title {
+                    font-weight: bold;
+                    font-size: 16px;
+                    subcontrol-origin: margin;
+                    left: 3px;
+                    padding: 0 3px;
+                }
+            """)
+        test_layout = QVBoxLayout(test_section)
+        controls = QWidget()
+        controls_layout = QHBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+
+        if title == "Interlock System Check":
+            # ── Header banner ──────────────────────────────────────────────
+            test_layout.addWidget(self._make_tab_header(
+                "Interlock System Check",
+                "Verifies fan interlock and switch interlock state transitions (Open / Closed).",
+                "#b71c1c", "#e53935"
+            ))
+
+            # ── Controls row ───────────────────────────────────────────────
+            self.test_status_label = self._make_status_pill("● Test: Ready")
+            self.interlock_start_button = self._make_action_button(
+                "▶  Start Test", self._BTN_GREEN_SS
+            )
+            self.interlock_start_button.clicked.connect(self.start_interlock_test)
+            self.interlock_end_button = self._make_action_button(
+                "■  End Test", self._BTN_RED_SS
+            )
+            self.interlock_end_button.clicked.connect(self.end_interlock_test)
+            self.interlock_end_button.setEnabled(False)
+            test_layout.addLayout(
+                self._make_controls_row(
+                    self.test_status_label,
+                    self.interlock_start_button,
+                    self.interlock_end_button,
+                )
+            )
+
+            # ── Interlock state indicators ─────────────────────────────────
+            interlock_state_group = QGroupBox("Switch State")
+            interlock_state_group.setStyleSheet("""
+                QGroupBox {
+                    font-weight: bold; font-size: 9pt; color: #333;
+                    border: 1px solid #ced4da; border-radius: 6px;
+                    margin-top: 8px; padding-top: 10px;
+                    background-color: #f8f9fa;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin; subcontrol-position: top left;
+                    left: 12px; padding: 0 6px;
+                }
+            """)
+            state_outer = QHBoxLayout(interlock_state_group)
+            state_outer.setSpacing(12)
+            state_outer.setContentsMargins(12, 14, 12, 10)
+
+            self.interlock_status_layout = QHBoxLayout()
+            self.interlock_open_label = QLabel("🔓  OPEN")
+            self.interlock_open_label.setAlignment(Qt.AlignCenter)
+            self.interlock_open_label.setMinimumHeight(54)
+            self.interlock_open_label.setStyleSheet(self._STATE_IDLE_SS)
+
+            self.interlock_closed_label = QLabel("🔒  CLOSED")
+            self.interlock_closed_label.setAlignment(Qt.AlignCenter)
+            self.interlock_closed_label.setMinimumHeight(54)
+            self.interlock_closed_label.setStyleSheet(self._STATE_IDLE_SS)
+
+            state_outer.addWidget(self.interlock_open_label)
+            state_outer.addWidget(self.interlock_closed_label)
+            self.interlock_status_layout.addWidget(interlock_state_group)
+            test_layout.addLayout(self.interlock_status_layout)
+
+            # ── Console ────────────────────────────────────────────────────
+            test_layout.addWidget(self._make_console_header("  Interlock Test Output"))
+            self.interlock_console = self._make_dark_console(min_height=600)
+            test_layout.addWidget(self.interlock_console)
+
+        elif title == "System Self Test":
+            # ── Header banner ──────────────────────────────────────────────
+            test_layout.addWidget(self._make_tab_header(
+                "System Self Test",
+                "Executes a full end-to-end EtherCAT self-diagnostics pass on the DUT.",
+                "#1B5E20", "#388E3C"
+            ))
+
+            # ── Controls row ───────────────────────────────────────────────
+            self.test_status_label_start = self._make_status_pill("● Test: Ready")
+            self.self_start_button = self._make_action_button(
+                "▶  Start Test", self._BTN_GREEN_SS
+            )
+            self.self_start_button.clicked.connect(self.start_self_test)
+            test_layout.addLayout(
+                self._make_controls_row(self.test_status_label_start, self.self_start_button)
+            )
+
+            # ── Console ────────────────────────────────────────────────────
+            test_layout.addWidget(self._make_console_header("  Self Test Output"))
+            self.selftest_console = self._make_dark_console()
+            test_layout.addWidget(self.selftest_console)
+
+        elif title == "Impedance Scan":
+            # ── Header banner ──────────────────────────────────────────────
+            impedance_widget = QWidget()
+            impedance_layout = QVBoxLayout(impedance_widget)
+            impedance_layout.setContentsMargins(0, 0, 0, 0)
+            impedance_layout.setSpacing(8)
+
+            impedance_layout.addWidget(self._make_tab_header(
+                "Impedance Scan",
+                "Measures complex impedance (R + jX) at selected frequency across all 5 RF zones.",
+                "#004D40", "#00897B"
+            ))
+
+            # ── Control panel ──────────────────────────────────────────────
+            control_panel = QGroupBox("Test Parameters")
+            control_panel.setStyleSheet("""
+                QGroupBox {
+                    font-weight: bold; font-size: 9pt; color: #333;
+                    border: 1px solid #ced4da; border-radius: 6px;
+                    margin-top: 8px; padding-top: 10px; background-color: #f8f9fa;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin; subcontrol-position: top left;
+                    left: 12px; padding: 0 6px;
+                }
+                QLabel { font-weight: bold; color: #333; }
+                QComboBox {
+                    background-color: white; border: 1px solid #ced4da;
+                    padding: 4px 8px; font-weight: bold; color: #222; min-width: 120px;
+                    border-radius: 4px;
+                }
+                QComboBox:hover { border-color: #0288D1; }
+            """)
+            control_layout = QHBoxLayout(control_panel)
+            control_layout.setContentsMargins(12, 8, 12, 8)
+
+            self.frequencies = ["362.3 KHz", "400 KHz", "500 KHz", "50 MHz", "60 MHz", "70 MHz"]
+            freq_label = QLabel("Test Frequency:")
+            freq_label.setFont(QFont('Arial', 10))
+            self.freq_combo = QComboBox()
+            self.freq_combo.addItems(self.frequencies)
+            self.freq_combo.setCurrentIndex(0)
+            self.freq_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            control_layout.addWidget(freq_label)
+            control_layout.addWidget(self.freq_combo)
+            control_layout.addStretch()
+            impedance_layout.addWidget(control_panel)
+
+            # ── Zone panels ────────────────────────────────────────────────
+            self._zone_names_imp = ["Zone1-Inner", "Zone2-Mid_Inner", "Zone3-Mid_Edge", "Zone4-Edge", "Zone5-Outer"]
+            self._relay_values_imp = [0, 1, 2, 4, 8, 16, 32, 64, 127, 128, 135, 141, 142, 143]
+            self._measurement_tables_imp = {}
+
+            zones_scroll = QScrollArea()
+            zones_scroll.setWidgetResizable(True)
+            zones_container = QWidget()
+            zones_layout = QHBoxLayout(zones_container)
+            zones_layout.setContentsMargins(5, 5, 5, 5)
+            zones_layout.setSpacing(10)
+            for zone in self._zone_names_imp:
+                zone_panel = self._create_Impedance_zone_panel(zone)
+                zone_panel.setMinimumWidth(250)
+                zones_layout.addWidget(zone_panel)
+            zones_scroll.setWidget(zones_container)
+            impedance_layout.addWidget(zones_scroll, stretch=1)
+
+            # ── Measurement log ────────────────────────────────────────────
+            impedance_layout.addWidget(self._make_console_header("  Measurement Log"))
+            self._log_output_imp = self._make_dark_console(min_height=160, max_height=400)
+            impedance_layout.addWidget(self._log_output_imp)
+
+            clear_btn_imp = self._make_action_button("Clear Log", self._BTN_GRAY_SS,
+                                                     min_height=30, min_width=100)
+            clear_btn_imp.clicked.connect(self._clear_impedance_log_display)
+            clear_btn_imp.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            clear_row = QHBoxLayout()
+            clear_row.addStretch()
+            clear_row.addWidget(clear_btn_imp)
+            impedance_layout.addLayout(clear_row)
+
+            test_layout.addWidget(impedance_widget)
+
+        elif title == "Resistance Test":
+            # ── Header banner ──────────────────────────────────────────────
+            resistance_widget = QWidget()
+            resistance_layout = QVBoxLayout(resistance_widget)
+            resistance_layout.setContentsMargins(0, 0, 0, 0)
+            resistance_layout.setSpacing(8)
+
+            resistance_layout.addWidget(self._make_tab_header(
+                "Resistance Test",
+                "Measures DC resistance (Ω) across relay setpoints for each of the 5 RF zones.",
+                "#311B92", "#4527A0"
+            ))
+
+            # ── Zone panels ────────────────────────────────────────────────
+            self._zone_names = ["Zone1-Inner", "Zone2-Mid_Inner", "Zone3-Mid_Edge", "Zone4-Edge", "Zone5-Outer"]
+            self._relay_values = [0, 1, 2, 4, 8, 16, 32, 64, 127]
+            self._measurement_tables = {}
+
+            zones_scroll = QScrollArea()
+            zones_scroll.setWidgetResizable(True)
+            zones_container = QWidget()
+            zones_layout = QHBoxLayout(zones_container)
+            zones_layout.setContentsMargins(5, 5, 5, 5)
+            zones_layout.setSpacing(10)
+            for zone in self._zone_names:
+                zone_panel = self._create_resistance_zone_panel(zone)
+                zone_panel.setMinimumWidth(250)
+                zones_layout.addWidget(zone_panel)
+            zones_scroll.setWidget(zones_container)
+            resistance_layout.addWidget(zones_scroll, stretch=1)
+
+            # ── Measurement log ────────────────────────────────────────────
+            resistance_layout.addWidget(self._make_console_header("  Measurement Log"))
+            self._log_output = self._make_dark_console(min_height=160, max_height=400)
+            resistance_layout.addWidget(self._log_output)
+
+            clear_btn_res = self._make_action_button("Clear Log", self._BTN_GRAY_SS,
+                                                     min_height=30, min_width=100)
+            clear_btn_res.clicked.connect(self._clear_resistance_log_display)
+            clear_btn_res.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            clear_row = QHBoxLayout()
+            clear_row.addStretch()
+            clear_row.addWidget(clear_btn_res)
+            resistance_layout.addLayout(clear_row)
+
+            test_layout.addWidget(resistance_widget)
+
+        elif title == "DIMM Calibration":
+            # ── Header banner ──────────────────────────────────────────────
+            test_layout.addWidget(self._make_tab_header(
+                "DIMM Calibration",
+                "Runs the DIMM calibration sequence via the remote calibration script.",
+                "#E65100", "#F57C00"
+            ))
+
+            # ── Controls row ───────────────────────────────────────────────
+            self.DIMM_status_label_start = self._make_status_pill("● Test: Ready")
+            self.dimm_start_button = self._make_action_button(
+                "▶  Start Calibration", self._BTN_GREEN_SS
+            )
+            self.dimm_start_button.clicked.connect(self.dimm_cal_test)
+            test_layout.addLayout(
+                self._make_controls_row(self.DIMM_status_label_start, self.dimm_start_button)
+            )
+
+            # ── Progress bar ───────────────────────────────────────────────
+            self.dimm_progress = self._make_styled_progress("%p% complete")
+            test_layout.addWidget(self.dimm_progress)
+
+            # ── Console ────────────────────────────────────────────────────
+            test_layout.addWidget(self._make_console_header("  Calibration Output"))
+            self.dimmtest_console = self._make_dark_console()
+            test_layout.addWidget(self.dimmtest_console)
+
+        elif title == "VNA Calibration":
+            # ── Header banner ──────────────────────────────────────────────
+            test_layout.addWidget(self._make_tab_header(
+                "VNA Calibration",
+                "Performs electronic calibration of the vector network analyser (E-Cal module required).",
+                "#880E4F", "#AD1457"
+            ))
+
+            # ── Controls row ───────────────────────────────────────────────
+            self.VNA_status_label_start = self._make_status_pill("● Test: Ready")
+            self.VNA_start_button = self._make_action_button(
+                "▶  Start Calibration", self._BTN_GREEN_SS
+            )
+            self.VNA_start_button.clicked.connect(self.VNA_cal_test)
+            test_layout.addLayout(
+                self._make_controls_row(self.VNA_status_label_start, self.VNA_start_button)
+            )
+
+            # ── Progress bar ───────────────────────────────────────────────
+            self.vna_progress = self._make_styled_progress("%p% complete")
+            test_layout.addWidget(self.vna_progress)
+
+            # ── Console ────────────────────────────────────────────────────
+            test_layout.addWidget(self._make_console_header("  Calibration Output"))
+            self.VNAtest_console = self._make_dark_console()
+            test_layout.addWidget(self.VNAtest_console)
+
+        elif title == "Verify BNC Port":
+            # ================================================================
+            # BNC Port Verification – UI layout
+            # ================================================================
+
+            # ── Header banner ──────────────────────────────────────────────
+            header = QFrame()
+            header.setMinimumHeight(52)
+            header.setStyleSheet("""
+                QFrame {
+                    background: qlineargradient(
+                        x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #1565C0, stop:1 #0288D1
+                    );
+                    border-radius: 6px;
+                }
+            """)
+            header_layout = QVBoxLayout(header)
+            header_layout.setContentsMargins(16, 8, 16, 8)
+            header_layout.setSpacing(2)
+
+            header_title = QLabel("BNC Port Verification")
+            header_title.setWordWrap(True)
+            header_title.setStyleSheet(
+                "color: white; font-size: 14pt; font-weight: bold; background: transparent;"
+            )
+            header_layout.addWidget(header_title)
+            test_layout.addWidget(header)
+
+            # ── Controls row (status pill + Start button) ──────────────────
+            controls_row = QHBoxLayout()
+            controls_row.setSpacing(12)
+
+            self.BNC_status_label_start = QLabel("● Test: Ready")
+            self.BNC_status_label_start.setAlignment(Qt.AlignCenter)
+            self.BNC_status_label_start.setMinimumWidth(160)
+            self.BNC_status_label_start.setStyleSheet("""
+                QLabel {
+                    background-color: #17a2b8;
+                    color: white;
+                    padding: 6px 14px;
+                    border-radius: 14px;
+                    font-weight: bold;
+                    font-size: 10pt;
+                }
+            """)
+
+            self.BNC_start_button = QPushButton("▶  Start Test")
+            self.BNC_start_button.setMinimumHeight(38)
+            self.BNC_start_button.setMinimumWidth(150)
+            self.BNC_start_button.setCursor(Qt.PointingHandCursor)
+            self.BNC_start_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    border: none;
+                    border-radius: 5px;
+                    font-size: 10pt;
+                    font-weight: bold;
+                    padding: 6px 18px;
+                }
+                QPushButton:hover    { background-color: #218838; }
+                QPushButton:pressed  { background-color: #1e7e34; }
+                QPushButton:disabled { background-color: #94d3a2; color: #e9f7ed; }
+            """)
+            self.BNC_start_button.clicked.connect(self.BNC_test)
+
+            controls_row.addWidget(self.BNC_status_label_start)
+            controls_row.addStretch()
+            controls_row.addWidget(self.BNC_start_button)
+            test_layout.addLayout(controls_row)
+
+            # ── Zone status panel ──────────────────────────────────────────
+            zones_group = QGroupBox("Zone Status")
+            zones_group.setStyleSheet("""
+                QGroupBox {
+                    font-weight: bold;
+                    font-size: 9pt;
+                    color: #333;
+                    border: 1px solid #ced4da;
+                    border-radius: 6px;
+                    margin-top: 8px;
+                    padding-top: 10px;
+                    background-color: #f8f9fa;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    subcontrol-position: top left;
+                    left: 12px;
+                    padding: 0 6px;
+                }
+            """)
+            zones_outer = QVBoxLayout(zones_group)
+            zones_outer.setSpacing(8)
+            zones_outer.setContentsMargins(10, 12, 10, 10)
+
+            # Four zone indicator boxes — subtitles from the class-level mapping
+            zone_row = QHBoxLayout()
+            zone_row.setSpacing(10)
+            ZONE_DEFS = [
+                (znum, f"Zone {znum}", subtitle)
+                for znum, subtitle in self._BNC_ZONE_SUBTITLES.items()
+            ]
+            self.BNC_zone_labels = {}
+            for znum, zname, zdesc in ZONE_DEFS:
+                lbl = QLabel(f"⬜  {zname}\n{zdesc}")
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setMinimumHeight(56)
+                lbl.setStyleSheet("""
+                    QLabel {
+                        background-color: #e9ecef;
+                        color: #6c757d;
+                        border: 2px solid #ced4da;
+                        border-radius: 6px;
+                        font-size: 9pt;
+                        font-weight: bold;
+                        padding: 4px 6px;
+                    }
+                """)
+                self.BNC_zone_labels[znum] = lbl
+                zone_row.addWidget(lbl)
+            zones_outer.addLayout(zone_row)
+
+            # Progress bar inside the zone panel
+            self.bnc_progress_bar = QProgressBar()
+            self.bnc_progress_bar.setRange(0, 4)
+            self.bnc_progress_bar.setValue(0)
+            self.bnc_progress_bar.setFormat("%v / 4 zones complete")
+            self.bnc_progress_bar.setMinimumHeight(22)
+            self.bnc_progress_bar.setStyleSheet("""
+                QProgressBar {
+                    border: 1px solid #adb5bd;
+                    border-radius: 5px;
+                    background-color: #e9ecef;
+                    text-align: center;
+                    font-size: 8pt;
+                    color: #343a40;
+                }
+                QProgressBar::chunk {
+                    background: qlineargradient(
+                        x1:0, y1:0, x2:1, y2:0,
+                        stop:0 #28a745, stop:1 #20c997
+                    );
+                    border-radius: 5px;
+                }
+            """)
+            zones_outer.addWidget(self.bnc_progress_bar)
+            test_layout.addWidget(zones_group)
+
+            # ── Console header label ───────────────────────────────────────
+            console_header = QLabel("  Test Output")
+            console_header.setStyleSheet("""
+                QLabel {
+                    background-color: #343a40;
+                    color: #adb5bd;
+                    font-size: 8pt;
+                    font-weight: bold;
+                    padding: 4px 8px;
+                    border-top-left-radius: 4px;
+                    border-top-right-radius: 4px;
+                }
+            """)
+            test_layout.addWidget(console_header)
+
+            # ── Dark terminal console ──────────────────────────────────────
+            # Minimum height is 400 px (reduced from 500) to give room to the
+            # new zone status panel above while still showing ample output.
+            self.BNCtest_console = QTextBrowser()
+            self.BNCtest_console.setMinimumHeight(400)
+            self.BNCtest_console.setMaximumHeight(1500)
+            self.BNCtest_console.setStyleSheet("""
+                QTextBrowser {
+                    background-color: #0d1117;
+                    color: #c9d1d9;
+                    border: 1px solid #30363d;
+                    border-top: none;
+                    border-bottom-left-radius: 4px;
+                    border-bottom-right-radius: 4px;
+                    font-family: 'Courier New', Consolas, monospace;
+                    font-size: 10pt;
+                    padding: 6px;
+                    selection-background-color: #264f78;
+                }
+            """)
+            test_layout.addWidget(self.BNCtest_console)
+
+
+        else:
+            pass
+
+        layout.addWidget(test_section)
+        return tab
+
+
+    def append_interlock_message(self, message, is_error=False):
+        """Helper method to append colored messages to interlock console"""
+        if is_error:
+            self.interlock_console.append(f'<span style="color:#f85149; font-weight:bold;">{message}</span>')
+        else:
+            self.interlock_console.append(f'<span style="color:#3fb950; font-weight:bold;">{message}</span>')
+        # Auto-scroll to bottom
+        self.interlock_console.verticalScrollBar().setValue(
+            self.interlock_console.verticalScrollBar().maximum()
+        )
+
+
+    def append_self_message(self, message, is_error=False):
+        """Helper method to append colored messages to interlock console"""
+        if is_error:
+            self.selftest_console.append(f'<span style="color:#f85149; font-weight:bold;">{message}</span>')
+        else:
+            self.selftest_console.append(f'<span style="color:#3fb950; font-weight:bold;">{message}</span>')
+        # Auto-scroll to bottom
+        self.selftest_console.verticalScrollBar().setValue(
+            self.selftest_console.verticalScrollBar().maximum()
+        )
+
+
+    def start_self_test(self):
+        try:
+            if self.self_t >= 1:
+                excel_logger.reset_sheet("Self Test")
+            self.self_t += 1
+            self.selftest_console.clear()
+            success, message = self.ssh_handler.Connect_RPI()
+            if not success:
+                self.handle_ssh_error(f"Connection failed: {message}")
+                self.append_self_message(f"SSH connection Failed", is_error=True)
+                return
+            self.test_status_label_start.setText("● Running…")
+            self.test_status_label_start.setStyleSheet(self._PILL_RUN_SS)
+            self.append_self_message("\n==================Self Test Started=======================\n")
+            self.append_self_message("\nWait Test in process..........\n")
+            self.execute_command("selftest", self.handle_self_test_output, 0)
+        except Exception as e:
+            self.logger.error(f"Error in self_test : {str(e)}", exc_info=True, extra={'func_name': 'start_self_test'})
+            QMessageBox.critical(self, "Error", f"SELF TEST FAIL: {str(e)}")
+        finally:
+            self.ssh_handler.SSH_disconnect()
+
+
+    def start_interlock_test(self):
+        try:
+            # Clean up any existing test
+            if self.impedance_scan >= 1:
+                excel_logger.reset_sheet("Interlock Test")
+            self.impedance_scan += 1
+            self.fan_interlock = 30
+
+            if hasattr(self, 'worker') and self.worker:
+                try:
+                    self.worker.output_ready.disconnect(self.handle_interlock_output)
+                    self.worker.finished_signal.disconnect(self.on_interlock_test_finished)
+                    self.worker.error_occurred.disconnect(self.handle_interlock_error)
+                except (TypeError, RuntimeError):
+                    pass
+                self.worker.stop()
+
+            # Reset UI state
+            self.interlock_console.clear()
+            self.append_interlock_message("\n1. Fan Interlock Test Started\n")
+            self.open_count = 0
+            self.closed_count = 0
+            # self.update_interlock_counters()
+
+            # Create new worker
+            self.worker = Worker(
+                self.ssh_handler,
+                '/home/robot/Manufacturing_test/aipc_beta/Interlock.py',
+                'ecat test_interlock'
+            )
+
+            # Connect signals
+            self.worker.output_ready.connect(self.handle_interlock_output)
+            self.worker.finished_signal.connect(self.on_interlock_test_finished)
+            self.worker.error_occurred.connect(self.handle_interlock_error)
+
+            # Update UI
+            self.interlock_start_button.setEnabled(False)
+            self.interlock_end_button.setEnabled(True)
+            self.test_status_label.setText("● Running…")
+            self.test_status_label.setStyleSheet(self._PILL_RUN_SS)
+
+            # Start the thread
+            self.worker.start()
+
+        except Exception as e:
+            self.append_interlock_message(f"Failed to start test: {str(e)}", is_error=True)
+            self.cleanup_resources()
+
+
+    def handle_interlock_error(self, error_msg):
+        self.append_interlock_message(f"ERROR: {error_msg}", is_error=True)
+        self.cleanup_resources()
+
+
+    def handle_interlock_output(self, line):
+        """Handle output from the interlock test"""
+        if "Error in slave initialization" in line:
+            QMessageBox.critical(
+                self,
+                "Critical Error",
+                "Slave initialization failed! Please check the EtherCAT connection and restart the test."
+            )
+            self.interlock_start_button.setEnabled(True)
+            self.worker.stop()
+
+        if "Cooling Fan Working" in line:
+            self.fan_interlock = True
+            self.append_interlock_message("✔ Fan Interlock Pass \n\n")
+            time.sleep(1)
+            self.append_interlock_message("\n2. Switch Interlock Test Started\n\n")
+            self.append_interlock_message("\nPress the Interlock Switch.......\n")
+            time.sleep(1)
+
+        if "Cooling Fan Warning" in line:
+            self.fan_interlock = False
+            self.over_all_result = "FAIL"
+            self.append_interlock_message("✖ Fan Interlock Fail \n\n", is_error=True)
+            # time.sleep(1)
+            self.append_interlock_message("\n2. Switch Interlock Test Started\n\n")
+            self.append_interlock_message("\nPress the Interlock Switch.......\n")
+            # time.sleep(1)
+            # self.check = True
+
+        if "Interlock Open" in line:
+            self.open_count += 1
+            self.interlock_open_label.setStyleSheet(self._STATE_OPEN_SS)
+            self.interlock_open_label.setText(f"OPEN")
+            if self.open_count == 1:
+                self.check_true += 1
+                # self.append_interlock_message("Interlock Open detected")
+        elif "Interlock Closed" in line:
+            self.closed_count += 1
+            self.interlock_closed_label.setStyleSheet(self._STATE_CLOSED_SS)
+            self.interlock_closed_label.setText(f"CLOSED")
+            if self.closed_count == 1:
+                self.check_true += 1
+                self.append_interlock_message("Interlock Closed detected")
+        if self.check_true == 1:
+            # self.append_interlock_message("Press the Interlock Switch.......")
+            # QMessageBox.information("Press the Interlock switch and ok buttom")
+            self.check_true += 1
+
+
+    def end_interlock_test(self):
+        try:
+            if self.fan_interlock != 30:
+                open_count = False
+                close_count = False
+                if hasattr(self, 'worker') and self.worker:
+                    self.worker.stop()
+
+                if self.closed_count >= 1:
+                    close_count = True
+
+                if self.open_count >= 1:
+                    open_count = True
+
+                test_passed = self.closed_count >= 1 and self.open_count >= 1
+
+                if self.fan_interlock:
+                    result_msg_i = "TEST PASSED - Fan Interlock detected properly"
+                else:
+                    result_msg_i = "TEST FAILED -  Fan Interlock test Fail"
+
+                if test_passed:
+                    result_msg = "TEST PASSED - Interlock switch detected properly"
+                    self.append_interlock_message(result_msg)
+                    self.test_status_label.setText("● Completed — PASS")
+                    self.test_status_label.setStyleSheet(self._PILL_PASS_SS)
+                    count = True
+                else:
+                    result_msg = f"TEST FAILED -  Interlock test Fail"
+                    self.over_all_result = 'FAIL'
+                    self.append_interlock_message(result_msg, is_error=True)
+                    self.test_status_label.setText("● Completed — FAIL")
+                    self.test_status_label.setStyleSheet(self._PILL_FAIL_SS)
+                    # Log to Excel
+
+                self.excel_logger.log_interlock_test(
+                    test_name='FAN Interlock',
+                    open_count='NA',
+                    closed_count='NA',
+                    test_passed=self.fan_interlock,
+                    notes=result_msg_i
+                )
+
+                self.excel_logger.log_summary(
+                    teststep_data={
+                        'teststep': 'FAN Test',
+                        'status': "PASS" if self.fan_interlock else "FAIL"  # Updates the existing row
+                    }
+                )
+                self.excel_logger.log_interlock_test(
+                    test_name='Switch Interlock',
+                    open_count=open_count,
+                    closed_count=close_count,
+                    test_passed=test_passed,
+                    notes=result_msg
+                )
+                self.excel_logger.log_summary(
+                    teststep_data={
+                        'teststep': 'Interlock Test',
+                        'status':  "PASS" if test_passed else "FAIL"
+                    }
+                )
+
+                self.excel_logger.log_summary(
+                    metadata={
+                        'end_time': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        'overall_result': self.over_all_result
+                    }
+                )
+                self.excel_logger.update_overall_result(self.over_all_result)
+
+
+
+            else:
+                result_msg = f"TEST aborted without any test"
+                self.append_interlock_message(result_msg, is_error=True)
+
+        except Exception as e:
+            self.append_interlock_message(f"Error ending test: {str(e)}", is_error=True)
+            self.worker.stop()
+        finally:
+            self.interlock_end_button.setEnabled(False)
+            self.interlock_start_button.setEnabled(True)
+
+
+    def cleanup_resources(self):
+        try:
+            if hasattr(self, 'worker') and self.worker:
+                self.worker.stop()
+
+            if hasattr(self, '_ssh_console_worker') and self._ssh_console_worker:
+                self._ssh_console_worker.stop()
+
+            if hasattr(self, 'ssh_handler') and self.ssh_handler.is_connect:
+                self.ssh_handler.SSH_disconnect()
+
+        except Exception as e:
+            self.logger.error(f"Cleanup error: {str(e)}", exc_info=True, extra={'func_name': 'cleanup_resources'})
+
+
+    def on_interlock_test_finished(self):
+        """Clean up after test completion"""
+        self.ssh_handler.SSH_disconnect()
+        # self.ssh_status_label.setText("SSH: Disconnected")
+        # self.ssh_status_label.setStyleSheet("background-color: #dc3545; color: white;")
+
+
+    def reset_interlock_test(self):
+        """Reset the test state"""
+        self.interlock_start_button.setEnabled(True)
+        self.interlock_end_button.setEnabled(False)
+        self.test_status_label.setText("Test: Ready")
+        self.test_status_label.setStyleSheet(self._PILL_READY_SS)
+
+
+    def create_unit_setup_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        # ── Header banner ──────────────────────────────────────────────────
+        layout.addWidget(self._make_tab_header(
+            "Unit Setup",
+            "Enter PCB / assembly information, connect to the Raspberry Pi, and program the OTP.",
+            "#1a237e", "#283593"
+        ))
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QHBoxLayout(scroll_content)
+        scroll_layout.setContentsMargins(0, 0, 5, 0)
+        scroll_layout.setSpacing(10)
+
+        details_section = QGroupBox()
+        details_section.setStyleSheet("""
+                QGroupBox {
+                    background-color: #f0f0f0;
+                    padding: 12px;
+                    border-radius: 5px;
+                    font-size: 16px;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 3px;
+                    padding: 0 3px;
+                }
+            """)
+        details_layout = QVBoxLayout(details_section)
+
+        # PCB Information Group - Three fields in one line
+        pcb_info_group = QWidget()
+        pcb_info_layout = QVBoxLayout(pcb_info_group)
+        pcb_info_layout.setContentsMargins(0, 0, 0, 0)
+
+        pcb_info_label = QLabel("PCB Information *")
+        pcb_info_label.setStyleSheet("color: red;")
+        pcb_info_layout.addWidget(pcb_info_label)
+
+        # Horizontal container for the three fields
+        pcb_fields_container = QWidget()
+        pcb_fields_layout = QHBoxLayout(pcb_fields_container)
+        pcb_fields_layout.setContentsMargins(0, 0, 0, 0)
+        pcb_fields_layout.setSpacing(10)
+
+        # PCB Part Number (format: XXX-AXXXXX-XXX)
+        pcb_pn_group = QWidget()
+        pcb_pn_layout = QVBoxLayout(pcb_pn_group)
+        pcb_pn_layout.setContentsMargins(0, 0, 0, 0)
+        pcb_pn_label = QLabel("Control Part Number")
+        pcb_pn_layout.addWidget(pcb_pn_label)
+
+        self.pcb_pn_input = QLineEdit()
+        self.pcb_pn_input.setPlaceholderText("Format: 123-A45678-901")
+        self.pcb_pn_input.setMinimumHeight(38)
+        pcb_pn_layout.addWidget(self.pcb_pn_input)
+        pcb_fields_layout.addWidget(pcb_pn_group)
+
+        # PCB Revision (3 characters)
+        pcb_rev_group = QWidget()
+        pcb_rev_layout = QVBoxLayout(pcb_rev_group)
+        pcb_rev_layout.setContentsMargins(0, 0, 0, 0)
+        pcb_rev_label = QLabel("Control Revision")
+        pcb_rev_layout.addWidget(pcb_rev_label)
+
+        self.pcb_rev_input = QLineEdit()
+        self.pcb_rev_input.setPlaceholderText("Format: A")
+        self.pcb_rev_input.setMaxLength(3)
+        self.pcb_rev_input.setMinimumHeight(38)
+        pcb_rev_layout.addWidget(self.pcb_rev_input)
+        pcb_fields_layout.addWidget(pcb_rev_group)
+
+        # PCB Serial Number (12 characters)
+        pcb_sn_group = QWidget()
+        pcb_sn_layout = QVBoxLayout(pcb_sn_group)
+        pcb_sn_layout.setContentsMargins(0, 0, 0, 0)
+        pcb_sn_label = QLabel("Control Serial Number")
+        pcb_sn_layout.addWidget(pcb_sn_label)
+
+        self.pcb_sn_input = QLineEdit()
+        # self.pcb_sn_input.setPlaceholderText()
+        self.pcb_sn_input.setMaxLength(12)
+        self.pcb_sn_input.setMinimumHeight(38)
+        pcb_sn_layout.addWidget(self.pcb_sn_input)
+        pcb_fields_layout.addWidget(pcb_sn_group)
+
+        pcb_info_layout.addWidget(pcb_fields_container)
+        details_layout.addWidget(pcb_info_group)
+
+        # Assembly Information Group - Three fields in one line
+        assembly_info_group = QWidget()
+        assembly_info_layout = QVBoxLayout(assembly_info_group)
+        assembly_info_layout.setContentsMargins(0, 0, 0, 0)
+
+        assembly_info_label = QLabel("Assembly Information *")
+        assembly_info_label.setStyleSheet("color: red;")
+        assembly_info_layout.addWidget(assembly_info_label)
+
+        # Horizontal container for the three fields
+        assembly_fields_container = QWidget()
+        assembly_fields_layout = QHBoxLayout(assembly_fields_container)
+        assembly_fields_layout.setContentsMargins(0, 0, 0, 0)
+        assembly_fields_layout.setSpacing(10)
+
+        # Assembly Part Number (format: XXX-AXXXXX-XXX)
+        assembly_pn_group = QWidget()
+        assembly_pn_layout = QVBoxLayout(assembly_pn_group)
+        assembly_pn_layout.setContentsMargins(0, 0, 0, 0)
+        assembly_pn_label = QLabel("Part Number")
+        assembly_pn_layout.addWidget(assembly_pn_label)
+
+        self.assembly_pn_input = QLineEdit()
+        self.assembly_pn_input.setPlaceholderText("Format: 123-A45678-901")
+        self.assembly_pn_input.setMinimumHeight(38)
+        assembly_pn_layout.addWidget(self.assembly_pn_input)
+        assembly_fields_layout.addWidget(assembly_pn_group)
+
+        # Assembly Revision (3 characters)
+        assembly_rev_group = QWidget()
+        assembly_rev_layout = QVBoxLayout(assembly_rev_group)
+        assembly_rev_layout.setContentsMargins(0, 0, 0, 0)
+        assembly_rev_label = QLabel("Revision")
+        assembly_rev_layout.addWidget(assembly_rev_label)
+
+        self.assembly_rev_input = QLineEdit()
+        self.assembly_rev_input.setPlaceholderText("Format: A")
+        self.assembly_rev_input.setMaxLength(3)
+        self.assembly_rev_input.setMinimumHeight(38)
+        assembly_rev_layout.addWidget(self.assembly_rev_input)
+        assembly_fields_layout.addWidget(assembly_rev_group)
+
+        # Assembly Serial Number (12 characters)
+        assembly_sn_group = QWidget()
+        assembly_sn_layout = QVBoxLayout(assembly_sn_group)
+        assembly_sn_layout.setContentsMargins(0, 0, 0, 0)
+        assembly_sn_label = QLabel("Serial Number")
+        assembly_sn_layout.addWidget(assembly_sn_label)
+
+        self.assembly_sn_input = QLineEdit()
+        # self.assembly_sn_input.setPlaceholderText()
+        self.assembly_sn_input.setMaxLength(12)
+        self.assembly_sn_input.setMinimumHeight(38)
+        assembly_sn_layout.addWidget(self.assembly_sn_input)
+        assembly_fields_layout.addWidget(assembly_sn_group)
+
+        assembly_info_layout.addWidget(assembly_fields_container)
+        details_layout.addWidget(assembly_info_group)
+
+        VN_FN_info_group = QWidget()
+        VN_FN_info_layout = QVBoxLayout(VN_FN_info_group)
+        VN_FN_info_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Horizontal container for the two fields
+        VN_FN_fields_container = QWidget()
+        VN_FN_fields_layout = QHBoxLayout(VN_FN_fields_container)
+        VN_FN_fields_layout.setContentsMargins(0, 0, 0, 0)
+        VN_FN_fields_layout.setSpacing(10)
+
+        # Vendor Name field
+        VN_group = QWidget()
+        VN_layout = QVBoxLayout(VN_group)  # Fixed: Create new layout for VN_group
+        VN_layout.setContentsMargins(0, 0, 0, 0)
+        VN_label = QLabel("Vendor Name")
+        VN_layout.addWidget(VN_label)
+
+        self.Vendor_name = QLineEdit()
+        self.Vendor_name.setMinimumHeight(38)
+        VN_layout.addWidget(self.Vendor_name)
+        VN_FN_fields_layout.addWidget(VN_group)
+
+        # Fixture Number field
+        FN_group = QWidget()
+        FN_layout = QVBoxLayout(FN_group)
+        FN_layout.setContentsMargins(0, 0, 0, 0)
+        FN_label = QLabel("Fixture Number")
+        FN_layout.addWidget(FN_label)
+
+        self.Fixture = QLineEdit()
+        self.Fixture.setMinimumHeight(38)
+        FN_layout.addWidget(self.Fixture)
+        VN_FN_fields_layout.addWidget(FN_group)
+
+        VN_FN_info_layout.addWidget(VN_FN_fields_container)
+        details_layout.addWidget(VN_FN_info_group)
+
+        # self.Vendor_name = self.create_form_row("Vendor Name", QLineEdit(), details_layout)
+
+        # Rest of the fields
+        # self.Test_date = self.create_form_row("Test Date", QLineEdit(), details_layout)
+        self.Test_Date = QDateEdit()
+        self.Test_Date.setCalendarPopup(True)
+        self.Test_Date.setDate(QDate.currentDate())
+        self.Test_Date.setDisplayFormat("yyyy-MM-dd")
+        self.create_form_row("Test Date", self.Test_Date, details_layout)
+
+        self.Test_name = self.create_form_row("Test Operator Name", QLineEdit(), details_layout)
+        # self.VNA_calibration = self.create_form_row("VNA Calibration Date", QLineEdit(), details_layout)
+        self.VNA_calibration = QDateEdit()
+        self.VNA_calibration.setCalendarPopup(True)
+        self.VNA_calibration.setDate(QDate.currentDate())
+        self.VNA_calibration.setDisplayFormat("yyyy-MM-dd")
+        self.create_form_row("VNA calibration", self.VNA_calibration, details_layout)
+
+        self.VNA_SN = self.create_form_row("VNA SN", QLineEdit(), details_layout)
+        self.Ecal_SN = self.create_form_row("Ecal SN", QLineEdit(), details_layout)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.HLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        details_layout.addWidget(separator)
+
+        self.product_id = self.create_form_row("Product ID", QLineEdit(), details_layout, True)
+        self.esi_revision = self.create_form_row("ESI Revision", QLineEdit(), details_layout, True)
+        self.configuration_id = self.create_form_row("Configuration ID", QLineEdit(), details_layout, True)
+        self.ethercat_address = self.create_form_row("EtherCAT Address", QLineEdit(), details_layout, True)
+        self.firmware_version = self.create_form_row("Firmware Version", QLineEdit(), details_layout, True)
+
+        scroll_layout.addWidget(details_section)
+
+        # Configuration section
+        config_section = QGroupBox()
+        config_section.setStyleSheet(details_section.styleSheet())
+        config_layout = QVBoxLayout(config_section)
+        config_layout.setSpacing(15)
+
+        def add_config_widget(label, widget, readonly=False):
+            container = QWidget()
+            container_layout = QVBoxLayout(container)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(5)
+
+            lbl = QLabel(label)
+            container_layout.addWidget(lbl)
+
+            if isinstance(widget, QLineEdit):
+                widget.setMinimumHeight(38)
+                if readonly:
+                    widget.setReadOnly(True)
+                    widget.setStyleSheet("""
+                            background-color: #e9ecef;
+                            color: #495057;
+                            border: 1px solid #ced4da;
+                            font-weight: bold;
+                        """)
+
+            container_layout.addWidget(widget)
+            container_layout.addSpacing(10)
+            config_layout.addWidget(container)
+            return widget
+
+        self.test_purpose = add_config_widget("Test Purpose", QComboBox())
+        self.test_purpose.addItem("High Volume Manufacturing Test")
+
+        otp_program_container = QWidget()
+        otp_program_layout = QVBoxLayout(otp_program_container)
+        otp_program_layout.setContentsMargins(0, 0, 0, 0)
+        otp_program_layout.setSpacing(5)
+
+        self.otp_program_btn = QPushButton("OTP Program")
+        self.otp_program_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #28a745;
+                    color: white;
+                    padding: 10px;
+                    font-size: 30px;
+                    font-weight: bold;
+                    min-height: 45px;
+                }
+                QPushButton:hover {
+                    background-color: #218838;
+                }
+                QPushButton:disabled {
+                    background-color: #cccccc;
+                    color: #666666;
+                }
+            """)
+        self.otp_program_btn.clicked.connect(self.program_otp)  # Connect to your OTP programming function
+        otp_program_layout.addWidget(self.otp_program_btn)
+        otp_program_layout.addSpacing(15)
+        config_layout.addWidget(otp_program_container)
+
+        # self.pcb_pn = add_config_widget("PCB Part Number", QLineEdit(), True)
+        # self.pcb_sn = add_config_widget("PCB Serial Number", QLineEdit(), True)
+        # self.pcb_revision = add_config_widget("PCB Revision", QLineEdit(), True)
+        # self.assembly_pn = add_config_widget("Assembly Part Number", QLineEdit(), True)
+        # self.assembly_sn = add_config_widget("Assembly Serial Number", QLineEdit(), True)
+        # self.assembly_revision = add_config_widget("Assembly Revision", QLineEdit(), True)
+
+        auto_load_container = QWidget()
+        auto_load_layout = QVBoxLayout(auto_load_container)
+        auto_load_layout.setContentsMargins(0, 0, 0, 0)
+        auto_load_layout.setSpacing(5)
+
+        self.auto_load_btn = QPushButton("Auto Load and Connect")
+        self.auto_load_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #007bff; 
+                    color: white;
+                    padding: 10px;
+                    font-size: 20 px;
+                    font-weight: bold;
+                    min-height: 45px;
+                }
+                QPushButton:hover {
+                    background-color: #0069d9;
+                }
+                QPushButton:disabled {
+                    background-color: #cccccc;
+                    color: #666666;
+                }
+            """)
+        self.auto_load_btn.clicked.connect(self.auto_load_connect)
+        auto_load_layout.addWidget(self.auto_load_btn)
+        auto_load_layout.addSpacing(15)
+        config_layout.addWidget(auto_load_container)
+
+        console_group = QGroupBox("Console Output")
+        console_group.setStyleSheet("""
+                QGroupBox {
+                    background-color: white;
+                    padding: 10px;
+                    border-radius: 5px;
+                    font-size: 20px;
+                    font-weight: bold;
+                }
+                QGroupBox::title {
+                    subcontrol-origin: margin;
+                    left: 5px;
+                    padding: 0 3px;
+                }
+            """)
+        console_layout = QVBoxLayout(console_group)
+        console_layout.setContentsMargins(5, 15, 5, 5)
+        console_layout.setSpacing(5)
+
+        console_buttons = QHBoxLayout()
+        clear_btn = self._make_action_button("⌫  Clear Console", self._BTN_GRAY_SS,
+                                             min_height=30, min_width=120)
+        clear_btn.clicked.connect(lambda: self.console_output.clear() if hasattr(self, 'console_output') else None)
+        console_buttons.addWidget(clear_btn)
+        console_buttons.addStretch()
+        console_layout.addLayout(console_buttons)
+
+        self.console_output = QTextEdit()
+        self.console_output.setReadOnly(True)
+        self.console_output.setAcceptRichText(True)
+        self.console_output.setStyleSheet("""
+            QTextEdit {
+                background-color: #0d1117;
+                color: #c9d1d9;
+                border: 1px solid #30363d;
+                border-radius: 4px;
+                font-family: 'Courier New', Consolas, monospace;
+                font-size: 11pt;
+                padding: 6px;
+                min-height: 600px;
+                selection-background-color: #264f78;
+            }
+        """)
+        console_layout.addWidget(self.console_output)
+        config_layout.addWidget(console_group)
+        config_layout.addStretch(1)
+        # Increase maximum block count for larger output
+
+        scroll_layout.addWidget(config_section)
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
+        return tab
+
+
+    def create_ssh_console_tab(self):
+        """Create a PuTTY/MobaXterm-style interactive SSH console tab."""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(6)
+
+        # ── Header banner ──────────────────────────────────────────────────
+        layout.addWidget(self._make_tab_header(
+            "RPI Console",
+            "Interactive SSH terminal connected to the Raspberry Pi manufacturing controller.",
+            "#212121", "#37474F"
+        ))
+
+        # Terminal widget (created first so buttons can reference it directly)
+        self._ssh_console_output = TerminalWidget()
+
+        # ── Status / control bar ──────────────────────────────────────────
+        status_bar = QHBoxLayout()
+        status_bar.setSpacing(8)
+        rpi_host = self.ssh_handler.host
+        self._ssh_console_status = QLabel(f"⬤  Disconnected  |  {rpi_host}")
+        self._ssh_console_status.setStyleSheet(self._PILL_GRAY_SS)
+        status_bar.addWidget(self._ssh_console_status)
+        status_bar.addStretch()
+
+        self._ssh_connect_btn = self._make_action_button("⚡  Connect", self._BTN_GREEN_SS,
+                                                         min_height=32, min_width=110)
+        self._ssh_connect_btn.clicked.connect(self._ssh_console_connect)
+        status_bar.addWidget(self._ssh_connect_btn)
+
+        self._ssh_disconnect_btn = self._make_action_button("✕  Disconnect", self._BTN_RED_SS,
+                                                            min_height=32, min_width=110)
+        self._ssh_disconnect_btn.setEnabled(False)
+        self._ssh_disconnect_btn.clicked.connect(self._ssh_console_disconnect)
+        status_bar.addWidget(self._ssh_disconnect_btn)
+
+        clear_btn = self._make_action_button("⌫  Clear", self._BTN_GRAY_SS,
+                                             min_height=32, min_width=80)
+        clear_btn.clicked.connect(self._ssh_console_output.clear)
+        status_bar.addWidget(clear_btn)
+
+        layout.addLayout(status_bar)
+        layout.addWidget(self._ssh_console_output, stretch=1)
+
+        # ── SCP file transfer bar ─────────────────────────────────────────
+        scp_bar = QHBoxLayout()
+        scp_bar.setSpacing(8)
+
+        self._scp_upload_btn = self._make_action_button("⬆  Upload to RPI", self._BTN_TEAL_SS,
+                                                        min_height=32, min_width=140)
+        self._scp_upload_btn.setEnabled(False)
+        self._scp_upload_btn.clicked.connect(self._scp_upload)
+        scp_bar.addWidget(self._scp_upload_btn)
+
+        self._scp_download_btn = self._make_action_button("⬇  Download from RPI", self._BTN_PURPLE_SS,
+                                                          min_height=32, min_width=160)
+        self._scp_download_btn.setEnabled(False)
+        self._scp_download_btn.clicked.connect(self._scp_download)
+        scp_bar.addWidget(self._scp_download_btn)
+
+        scp_bar.addStretch()
+        layout.addLayout(scp_bar)
+
+        # Hint bar
+        hint = QLabel(
+            "Click terminal then type directly  |  "
+            "↑↓ history  ·  Tab completion  ·  Ctrl+C interrupt  ·  Ctrl+D EOF  ·  Right-click → Paste"
+        )
+        hint.setStyleSheet("color: #888; font-size: 8pt; padding: 2px 4px;")
+        layout.addWidget(hint)
+
+        self._ssh_console_worker = None
+        self._scp_worker = None
+        return tab
+
+    def _ssh_console_connect(self):
+        """Start the SSH console worker and connect to the Raspberry Pi."""
+        if self._ssh_console_worker and self._ssh_console_worker.isRunning():
+            return
+        h = self.ssh_handler
+        self._ssh_console_worker = SshConsoleWorker(
+            h.host, h.port, h.username, h.password
+        )
+        self._ssh_console_worker.output_ready.connect(self._ssh_console_append)
+        self._ssh_console_worker.connected.connect(self._ssh_console_on_connected)
+        self._ssh_console_worker.disconnected.connect(self._ssh_console_on_disconnected)
+        self._ssh_console_worker.error_occurred.connect(self._ssh_console_on_error)
+        self._ssh_console_worker.start()
+        self._ssh_connect_btn.setEnabled(False)
+        self._ssh_console_status.setText(f"⬤  Connecting…  |  {h.host}")
+        self._ssh_console_status.setStyleSheet(self._PILL_RUN_SS)
+
+    def _ssh_console_disconnect(self):
+        """Stop the SSH console worker."""
+        if self._ssh_console_worker:
+            self._ssh_console_worker.stop()
+
+    def _ssh_console_append(self, text):
+        """Forward received SSH output to the terminal widget."""
+        self._ssh_console_output.write(text)
+
+    def _ssh_console_on_connected(self):
+        h = self.ssh_handler
+        self._ssh_console_status.setText(f"⬤  Connected  |  {h.host}")
+        self._ssh_console_status.setStyleSheet(self._PILL_PASS_SS)
+        self._ssh_connect_btn.setEnabled(False)
+        self._ssh_disconnect_btn.setEnabled(True)
+        self._scp_upload_btn.setEnabled(True)
+        self._scp_download_btn.setEnabled(True)
+        self._ssh_console_output.set_send_fn(self._ssh_console_worker.send_command)
+        self._ssh_console_output.setFocus()
+
+    def _ssh_console_on_disconnected(self):
+        h = self.ssh_handler
+        self._ssh_console_status.setText(f"⬤  Disconnected  |  {h.host}")
+        self._ssh_console_status.setStyleSheet(self._PILL_GRAY_SS)
+        self._ssh_connect_btn.setEnabled(True)
+        self._ssh_disconnect_btn.setEnabled(False)
+        self._scp_upload_btn.setEnabled(False)
+        self._scp_download_btn.setEnabled(False)
+        self._ssh_console_output.set_send_fn(None)
+
+    def _ssh_console_on_error(self, msg):
+        self._ssh_console_output.write(f'\n[ERROR] {msg}\n')
+        self._ssh_console_on_disconnected()
+
+    # ------------------------------------------------------------------
+    # SCP file transfer
+    # ------------------------------------------------------------------
+    def _scp_upload(self):
+        """Let the user pick a local file then browse the RPI to choose destination."""
+        import posixpath
+
+        # 1. Choose local file with a native file picker
+        local_path, _ = QFileDialog.getOpenFileName(
+            self, "Select file to upload to RPI"
+        )
+        if not local_path:
+            return
+
+        # 2. Browse the RPI filesystem to select the destination directory
+        h = self.ssh_handler
+        browser = RemoteFileBrowserDialog(
+            h.host, h.port, h.username, h.password,
+            mode='dir',
+            start_path=f'/home/{h.username}',
+            parent=self
+        )
+        if browser.exec_() != QDialog.Accepted:
+            return
+        remote_path = posixpath.join(
+            browser.selected_path, os.path.basename(local_path)
+        )
+        self._run_scp_worker('upload', local_path, remote_path)
+
+    def _scp_download(self):
+        """Browse the RPI filesystem to pick a file, then choose local save location."""
+        h = self.ssh_handler
+
+        # 1. Browse the RPI filesystem to select the remote file
+        browser = RemoteFileBrowserDialog(
+            h.host, h.port, h.username, h.password,
+            mode='file',
+            start_path=f'/home/{h.username}',
+            parent=self
+        )
+        if browser.exec_() != QDialog.Accepted:
+            return
+        remote_path = browser.selected_path
+
+        # 2. Choose local save path with a native save dialog
+        local_path, _ = QFileDialog.getSaveFileName(
+            self, "Save downloaded file as",
+            os.path.basename(remote_path)
+        )
+        if not local_path:
+            return
+        self._run_scp_worker('download', local_path, remote_path)
+
+    def _run_scp_worker(self, direction, local_path, remote_path):
+        """Start a ScpWorker for the given direction."""
+        if self._scp_worker and self._scp_worker.isRunning():
+            QMessageBox.information(self, "SCP Busy",
+                                    "A file transfer is already in progress.")
+            return
+        h = self.ssh_handler
+        self._scp_worker = ScpWorker(
+            h.host, h.port, h.username, h.password,
+            direction, local_path, remote_path
+        )
+        self._scp_worker.progress.connect(self._ssh_console_output.write)
+        self._scp_worker.finished.connect(self._on_scp_finished)
+        self._scp_upload_btn.setEnabled(False)
+        self._scp_download_btn.setEnabled(False)
+        self._scp_worker.start()
+
+    def _on_scp_finished(self, success, message):
+        self._ssh_console_output.write('\n' + message + '\n')
+        # Re-enable SCP buttons only when still connected
+        if self._ssh_console_worker and self._ssh_console_worker.isRunning():
+            self._scp_upload_btn.setEnabled(True)
+            self._scp_download_btn.setEnabled(True)
+
+    # ------------------------------------------------------------------
+    # RPI Console tab password gate
+    # ------------------------------------------------------------------
+    _RPI_CONSOLE_PASSWORD = "lam@rpi"
+
+    def _on_tab_changed(self, index):
+        """Guard the RPI Console tab with a password prompt."""
+        if index != self._RPI_CONSOLE_TAB_INDEX:
+            # Remember this as the last accessible tab
+            self._last_tab_index = index
+            return
+        if self._rpi_console_unlocked:
+            return
+        pwd, ok = QInputDialog.getText(
+            self, "RPI Console – Access Required",
+            "Enter password to open the RPI Console:",
+            QLineEdit.Password
+        )
+        if ok and pwd == self._RPI_CONSOLE_PASSWORD:
+            self._rpi_console_unlocked = True
+        else:
+            if ok:  # wrong password was entered
+                QMessageBox.warning(self, "Access Denied", "Incorrect password.")
+            # Switch back to the previous tab without re-triggering the guard
+            self.tab_widget.blockSignals(True)
+            self.tab_widget.setCurrentIndex(self._last_tab_index)
+            self.tab_widget.blockSignals(False)
+
+    def init_ui(self):
+        """Initialize the user interface with responsive layouts"""
+        # Create a main scroll area
+        main_scroll = QScrollArea()
+        main_scroll.setWidgetResizable(True)
+
+        # Create the central widget that will hold everything
+        central_widget = QWidget()
+        self.main_layout = QVBoxLayout(central_widget)
+
+        # Create tab widget
+        self.tab_widget = QTabWidget()
+        self.main_layout.addWidget(self.tab_widget)
+
+        # Add tabs
+        self.tab_widget.addTab(self.create_unit_setup_tab(), "Unit Setup")
+        self.tab_widget.addTab(self.create_test_tab("Interlock System Check"), "Interlock")
+        self.tab_widget.addTab(self.create_test_tab("Verify BNC Port"), "BNC Port Verification")
+        self.tab_widget.addTab(self.create_test_tab("Impedance Scan"), "Impedance Scan")
+        self.tab_widget.addTab(self.create_test_tab("Resistance Test"), "Resistance")
+        self.tab_widget.addTab(self.create_test_tab("System Self Test"), "Self Test")
+        self.tab_widget.addTab(self.create_test_tab("DIMM Calibration"), "DIMM Cal")
+        self.tab_widget.addTab(self.create_test_tab("VNA Calibration"), "VNA Cal")
+        self.tab_widget.addTab(self.create_ssh_console_tab(), "RPI Console")
+
+        # RPI Console tab is the last tab; guard it with a password
+        self._RPI_CONSOLE_TAB_INDEX = self.tab_widget.count() - 1
+        self._rpi_console_unlocked = False
+        self._last_tab_index = 0
+        self.tab_widget.currentChanged.connect(self._on_tab_changed)
+
+        # Set the central widget
+        main_scroll.setWidget(central_widget)
+        self.setCentralWidget(main_scroll)
+
+
