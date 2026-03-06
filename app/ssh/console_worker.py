@@ -1,4 +1,5 @@
 import socket
+import threading
 import paramiko
 from PyQt5.QtCore import QThread, pyqtSignal
 
@@ -20,7 +21,7 @@ class SshConsoleWorker(QThread):
         self.password = password
         self._is_running = False
         self._channel = None
-        self._channel_lock = __import__('threading').Lock()
+        self._channel_lock = threading.Lock()
         self._ssh = None
 
     def run(self):
